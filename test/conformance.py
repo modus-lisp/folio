@@ -69,6 +69,7 @@ MICRO = [
     ("jbig2-generic", P("jbig2-generic.pdf"), 0, 2.0, "JBIG2 generic region (MQ arithmetic)"),
     ("jbig2-symbol",  P("jbig2-symbol.pdf"),  0, 2.0, "JBIG2 symbol dict + text region"),
     ("jbig2-globals", P("jbig2-globals.pdf"), 0, 2.0, "JBIG2 /JBIG2Globals shared symbols"),
+    ("type3-vector",  P("type3-vector.pdf"),  0, 2.0, "Type3 font (CharProcs: d0/d1 vector + bitmap glyphs)"),
 ]
 REAL = [
     ("arxiv-p0",   P("real-arxiv.pdf"),          0, 1.5, "academic paper (title)"),

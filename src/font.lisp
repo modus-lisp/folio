@@ -101,7 +101,11 @@ metric table used when /Widths is absent; SYMBOLIC-P marks Symbol/ZapfDingbats."
   widths               ; (simple-vector 256) code -> width (1000/em) or NIL
   (missing-width 0d0)  ; default width for codes outside FirstChar..LastChar
   afm-key              ; standard-metrics table name for absent /Widths
-  (type3 nil)          ; T for Type3 fonts (not rendered in M2)
+  (type3 nil)          ; T for Type3 fonts (glyphs are content-stream procedures)
+  ;; ---- Type3 font state (§9.6.5): glyphs are CharProc content streams ----
+  (font-matrix '(0.001d0 0d0 0d0 0.001d0 0d0 0d0)) ; glyph space -> text space
+  char-procs           ; /CharProcs dict: glyph-name -> content-stream
+  t3-resources         ; /Resources for the CharProc content streams
   ;; ---- embedded CFF (FontFile3 / Type1C) drawn by the folio interpreter ----
   cff                  ; folio CFF object, or NIL (FACE is used instead)
   ;; ---- embedded Type1 (FontFile / eexec) drawn by the folio interpreter ----
@@ -217,8 +221,22 @@ Helvetica substitute on any error)."
                          (%resolve doc (dict-get descriptor "Flags")))))
         (when (equal subtype "Type3")
           (return-from load-simple-font
-            (make-pdf-font :type3 t :face nil
-                           :encoding (build-encoding doc font-dict +standard-names+))))
+            (multiple-value-bind (wvec mw) (build-widths doc font-dict)
+              (let* ((fm-arr (%resolve doc (dict-get font-dict "FontMatrix")))
+                     (fm (if (and (pdf-array-p fm-arr) (>= (length fm-arr) 6))
+                             (loop for i below 6
+                                   collect (float (num (%resolve doc (aref fm-arr i))) 1d0))
+                             '(0.001d0 0d0 0d0 0.001d0 0d0 0d0)))
+                     (procs (%resolve doc (dict-get font-dict "CharProcs")))
+                     (t3res (%resolve doc (dict-get font-dict "Resources"))))
+                (make-pdf-font
+                 :type3 t :face nil
+                 :font-matrix fm
+                 :char-procs (and (hash-table-p procs) procs)
+                 :t3-resources (and (hash-table-p t3res) t3res)
+                 :encoding (build-encoding doc font-dict +standard-names+)
+                 :widths wvec
+                 :missing-width mw)))))
         (multiple-value-bind (families weight style afm-key symbolic)
             (standard-font-info basefont)
           (let* ((flag-symbolic (and (integerp flags) (logbitp 2 flags) ; bit 3 = Symbolic

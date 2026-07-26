@@ -344,8 +344,10 @@ or NIL if the image cannot be produced (deferred codec, etc.)."
           (return-from decode-image-to-rgba nil))))
     (let* ((bpc (if mask? 1 (let ((b (img-dget doc dict "BitsPerComponent" "BPC")))
                               (if b (round (num b)) 8))))
+           ;; /Decode may be a real pdf-array (XObject image) OR a Lisp list (an
+           ;; inline image, whose dict is read by the content lexer).
            (decode (let ((a (img-dget doc dict "Decode" "D")))
-                     (when (pdf-array-p a)
+                     (when (or (pdf-array-p a) (consp a))
                        (map 'list (lambda (x) (num (resolve doc x))) a))))
            (rgba (make-array (* w h 4) :element-type '(unsigned-byte 8)
                                        :initial-element 0)))

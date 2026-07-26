@@ -468,7 +468,16 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
                (gstate2-char-spacing s) (num (a 1)))
          (op-text-move ip 0d0 (- (gstate2-leading s)))
          (when (pdf-string-p (a 2)) (show-text ip (pdf-string-bytes (a 2)))))
-        ((or (string= kw "d0") (string= kw "d1")) nil) ; Type3 glyph metrics
+        ;; ---- Type3 glyph metric ops (§9.6.5), valid at the head of a CharProc ----
+        ;; d0 (wx wy): a COLOURED glyph — it paints its own colour; advance only.
+        ;; d1 (wx wy llx lly urx ury): an UNCOLOURED glyph — a mask painted in the
+        ;; current fill colour; colour operators inside are ignored.  We activate the
+        ;; uncolored gate (first cond clause) so subsequent colour ops are no-ops and
+        ;; the glyph paints in the inherited text fill colour.
+        ((string= kw "d0") nil)
+        ((string= kw "d1")
+         (setf (interp-uncolored-color ip)
+               (or (ignore-errors (gesso:current-fill ctx)) '(0 0 0))))
 
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
@@ -698,6 +707,8 @@ each glyph (CID -> GID), and advance by the per-CID /W width."
   "Show a byte string: for each code, paint its glyph at the text render matrix
 and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
   (let* ((s (interp-state ip)) (font (gstate2-font s)))
+    (when (and font (pdf-font-type3 font))
+      (return-from show-text (show-text-type3 ip font bytes)))
     (when (and font (pdf-font-composite font))
       (if (font-drawable-p font)
           (return-from show-text (show-text-composite ip bytes))
@@ -730,6 +741,82 @@ and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
              (tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
         (setf (interp-tm ip)
               (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))
+
+;;; ---- Type3 fonts (§9.6.5): glyphs are content-stream procedures -----------
+;;; A Type3 glyph is not an outline but a CHARPROC — a small content stream that
+;;; paints the glyph in glyph space.  glyph space maps to text space by the font's
+;;; /FontMatrix (typically ~[0.001 0 0 0.001 0 0], but arbitrary), text space maps
+;;; to user space by [Tfs*Th 0 0 Tfs 0 Ts]·Tm, and user space maps to device by the
+;;; current CTM.  We run the CharProc on a fresh sub-interpreter (like a form
+;;; XObject / tiling cell) whose gesso transform is the composed glyph->device
+;;; matrix, using the font's /Resources.  The proc opens with d0 (coloured: paints
+;;; its own colour) or d1 (uncoloured: a mask painted in the current fill colour).
+
+(defun text-space-param (s)
+  "The text-space parameter matrix [Tfs*Th 0 0 Tfs 0 Ts] (§9.4.4)."
+  (let ((fs (gstate2-font-size s)))
+    (list (* fs (gstate2-h-scale s)) 0d0 0d0 fs 0d0 (gstate2-rise s))))
+
+(defun type3-glyph->device (ip font)
+  "The glyph-space -> device matrix for a Type3 glyph at the current text state:
+CTM · Tm · [Tfs*Th 0 0 Tfs 0 Ts] · /FontMatrix."
+  (let* ((s (interp-state ip))
+         (fm (pdf-font-font-matrix font))
+         (g3 (gesso:mat-mul (gesso:mat-mul (interp-tm ip) (text-space-param s)) fm)))
+    (gesso:mat-mul (gstate2-ctm s) g3)))
+
+(defun paint-type3-glyph (ip font name)
+  "Paint the Type3 glyph named NAME by running its /CharProcs content stream on a
+sub-interpreter whose CTM maps glyph space to device.  Honours render mode (3/7
+paint nothing) and the form-recursion cycle guard."
+  (let* ((s (interp-state ip)) (ctx (interp-ctx ip))
+         (mode (gstate2-render-mode s)))
+    (when (member mode '(3 7)) (return-from paint-type3-glyph)) ; invisible/clip-only
+    (unless name (return-from paint-type3-glyph))
+    (let* ((doc (interp-doc ip))
+           (procs (pdf-font-char-procs font))
+           (proc (and (hash-table-p procs) (resolve doc (dict-get procs name)))))
+      (unless (pdf-stream-p proc) (return-from paint-type3-glyph))
+      (when (or (>= (interp-form-depth ip) *form-depth-limit*)
+                (member proc (interp-form-stack ip) :test #'eq))
+        (return-from paint-type3-glyph))
+      (let* ((gdev (type3-glyph->device ip font))
+             (res (or (pdf-font-t3-resources font) (interp-resources ip)))
+             (bytes (ignore-errors
+                     (decode-stream proc :resolver (lambda (v) (resolve doc v))))))
+        (when bytes
+          (gesso:save ctx)
+          (apply #'gesso:set-transform ctx gdev)
+          (let ((cip (make-interp
+                      :ctx ctx
+                      :state (%make-gstate2 :ctm (copy-list gdev)
+                                            :fill-alpha (gstate2-fill-alpha s)
+                                            :stroke-alpha (gstate2-stroke-alpha s))
+                      :resources res
+                      :doc doc
+                      :base-ctm (interp-base-ctm ip)
+                      :font-cache (interp-font-cache ip)
+                      :form-depth (1+ (interp-form-depth ip))
+                      :form-stack (cons proc (interp-form-stack ip)))))
+            (ignore-errors (run-content cip bytes)))
+          (gesso:restore ctx))))))
+
+(defun show-text-type3 (ip font bytes)
+  "Show a Type3 string: for each code, look up the glyph name via /Encoding, paint
+its CharProc, and advance Tm by (w0*Tfs + Tc + Tw?)*Th where w0 is the /Widths
+entry (glyph space) mapped to text space through the horizontal /FontMatrix scale."
+  (let* ((s (interp-state ip))
+         (enc (pdf-font-encoding font))
+         (fm-a (num (first (pdf-font-font-matrix font))))
+         (fs (gstate2-font-size s)) (tc (gstate2-char-spacing s))
+         (tw (gstate2-word-spacing s)) (th (gstate2-h-scale s)))
+    (loop for code across bytes do
+      (let* ((name (and enc (aref enc code)))
+             (w0 (* (font-code-width font code) fm-a))) ; glyph-space width -> text space
+        (paint-type3-glyph ip font name)
+        (let ((tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
+          (setf (interp-tm ip)
+                (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0))))))))
 
 (defun advance-only-composite (ip font bytes)
   "Advance Tm across a Type0 string without painting (no drawable descendant)."
