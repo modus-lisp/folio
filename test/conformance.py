@@ -48,6 +48,7 @@ MICRO = [
     ("img-smask",     P("img-smask.pdf"),     0, 2.0, "soft-mask alpha"),
     ("img-indexed",   P("img-indexed.pdf"),   0, 2.0, "indexed palette"),
     ("img-inline",    P("img-inline.pdf"),    0, 2.0, "inline image (BI)"),
+    ("ccitt-micro",   P("ccitt-micro.pdf"),   0, 4.0, "CCITT Group-4 fax image"),
     ("annot-stamp",   P("annot-stamp.pdf"),   0, 2.0, "annotation appearance (/AP)"),
 ]
 REAL = [

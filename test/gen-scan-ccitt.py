@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Generate a scanned-style PDF whose page is a bilevel CCITT Group-4 image —
-exercises folio's deferred CCITTFaxDecode path (expected: unsupported, blank)."""
+exercises folio's CCITTFaxDecode (ITU-T T.6) path.
+
+The page image is drawn naturally (black marks on a white background).  libtiff's
+CCITT encoder treats raw bit 0 as the fax "white" run, so the natural "1"-mode
+image (white background = 1) codes the background as fax-black; declaring
+/BlackIs1 true in the PDF flips the sample polarity back so the page renders as
+black marks on white (matching pdfium)."""
 import struct, zlib
 from PIL import Image, ImageDraw, ImageFont
 import io
@@ -15,9 +21,11 @@ for i, y in enumerate(range(120, 1300, 46)):
         d.rectangle([x, y, x + 5, y + 14], fill=0)
 d.rectangle([80, 60, 920, 66], fill=0)  # title rule
 
-# encode as CCITT Group 4 via a TIFF then pull the strip
+# encode as CCITT Group 4 via a TIFF then pull the strip.  Force a SINGLE strip:
+# libtiff codes each strip independently (own EOFB), so a multi-strip image would
+# concatenate several G4 sub-streams and a decoder would stop at the first EOFB.
 buf = io.BytesIO()
-img.save(buf, format="TIFF", compression="group4")
+img.save(buf, format="TIFF", compression="group4", strip_size=1 << 30)
 buf.seek(0)
 tif = Image.open(buf)
 # read TIFF strips manually
@@ -43,7 +51,7 @@ obj(4, ("<< /Length %d >>" % len(content)).encode() + b"\nstream\n" + content + 
 img_dict = ("<< /Type /XObject /Subtype /Image /Width %d /Height %d "
             "/BitsPerComponent 1 /ColorSpace /DeviceGray /ImageMask false "
             "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns %d /Rows %d "
-            "/BlackIs1 false >> /Length %d >>" % (W, H, W, H, len(g4)))
+            "/BlackIs1 true >> /Length %d >>" % (W, H, W, H, len(g4)))
 obj(5, img_dict.encode() + b"\nstream\n" + g4 + b"\nendstream")
 
 out = io.BytesIO()

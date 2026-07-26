@@ -397,6 +397,41 @@ is an /SMask giving alpha directly from its grayscale samples."
                 (setf (aref rgba (+ o 3))
                       (round (* (aref rgba (+ o 3)) alpha) 255))))))))))
 
+;;; ---- CCITT fax images (§7.4.6) --------------------------------------------
+(defun ccitt-decode-image (ip dict raw)
+  "Decode the CCITTFaxDecode-filtered RAW bytes of the image DICT into a packed
+1-bit-per-pixel DeviceGray sample buffer (row-major, MSB-first, byte-padded rows)
+that the ordinary BPC-1 image path consumes.  Reads /DecodeParms (or the inline
+abbreviation /DP): /K /Columns /Rows /BlackIs1 /EncodedByteAlign.  NIL on failure."
+  (let* ((doc (interp-doc ip))
+         (parms (let ((p (resolve doc (or (dict-get dict "DecodeParms")
+                                          (dict-get dict "DP")))))
+                  (cond ((hash-table-p p) p)
+                        ((pdf-array-p p)     ; multi-filter: the last dict entry
+                         (loop for i from (1- (length p)) downto 0
+                               for e = (resolve doc (aref p i))
+                               when (hash-table-p e) return e))
+                        (t nil))))
+         (width (let ((x (img-dget doc dict "Width" "W"))) (and x (round (num x)))))
+         (height (let ((x (img-dget doc dict "Height" "H"))) (and x (round (num x)))))
+         (pget (lambda (full abbr default)
+                 (let ((v (and (hash-table-p parms)
+                               (resolve doc (or (dict-get parms full)
+                                                (and abbr (dict-get parms abbr)))))))
+                   (if (or (null v) (pdf-null-p v)) default v))))
+         (k (let ((v (funcall pget "K" nil 0))) (if (numberp v) (round v) 0)))
+         (columns (let ((v (funcall pget "Columns" nil nil)))
+                    (cond ((numberp v) (round v)) (width width) (t 1728))))
+         (rows (let ((v (funcall pget "Rows" nil nil)))
+                 (cond ((numberp v) (round v)) (height height) (t 0))))
+         (black1 (let ((v (funcall pget "BlackIs1" nil nil))) (or (eq v :true) (eq v t))))
+         (align (let ((v (funcall pget "EncodedByteAlign" nil nil)))
+                  (or (eq v :true) (eq v t)))))
+    (when (and columns (> columns 0))
+      (ignore-errors
+       (values (ccitt-decode raw :columns columns :rows (or rows 0)
+                                 :k k :black-is-1 black1 :byte-align align))))))
+
 ;;; ---- painting an image XObject --------------------------------------------
 (defun draw-image-xobject (ip xobj)
   "Decode image XObject XOBJ and paint it through the CTM."
@@ -430,9 +465,17 @@ sample-unpacked) and blit it through the CTM onto the canvas."
                (apply-soft-mask ip dict rgba w h)
                (blit-rgba ip rgba w h))
              (pushnew "DCTDecode" *deferred-image-filters* :test #'string=))))
+      ;; ---- CCITT Group 3/4 fax: decode to a 1-bit sample buffer, then run the
+      ;;      ordinary BPC-1 / colour-space / ImageMask / Decode path ----
+      ((and left (member (car left) '("CCITTFaxDecode" "CCF") :test #'string=))
+       (let ((bits (ccitt-decode-image ip dict data)))
+         (if bits
+             (multiple-value-bind (rgba w h) (decode-image-to-rgba ip dict bits nil)
+               (when rgba (blit-rgba ip rgba w h)))
+             (pushnew (car left) *deferred-image-filters* :test #'string=))))
       ;; ---- deferred codecs ----
       ((and left (member (car left)
-                         '("JPXDecode" "CCITTFaxDecode" "CCF" "JBIG2Decode") :test #'string=))
+                         '("JPXDecode" "JBIG2Decode") :test #'string=))
        (pushnew (car left) *deferred-image-filters* :test #'string=))
       ;; ---- Flate/raw samples ----
       (t
