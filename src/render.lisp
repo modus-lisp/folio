@@ -50,6 +50,7 @@ under the CTM) is painted; text and images are parsed but not yet drawn."
                (ip (make-interp :ctx ctx
                                 :state (%make-gstate2 :ctm (copy-list m))
                                 :resources (page-resources page)
+                                :base-ctm (copy-list m)
                                 :doc doc)))
           ;; seed gesso's transform with the base device CTM
           (apply #'gesso:set-transform ctx m)
@@ -92,6 +93,7 @@ under the CTM) is painted; text and images are parsed but not yet drawn."
                (ip (make-interp :ctx ctx
                                 :state (%make-gstate2 :ctm (copy-list m))
                                 :resources (page-resources page)
+                                :base-ctm (copy-list m)
                                 :doc doc)))
           (apply #'gesso:set-transform ctx m)
           (clip-to-box ctx x0 y0 x1 y1)

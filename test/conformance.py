@@ -53,6 +53,13 @@ MICRO = [
     ("blend-modes",   P("blend-modes.pdf"),   0, 3.0, "ExtGState blend modes (/BM)"),
     ("smask-fade",    P("smask-fade.pdf"),    0, 3.0, "soft mask (/SMask luminosity)"),
     ("smask-image",   P("smask-image.pdf"),   0, 3.0, "image under /SMask (vignette)"),
+    ("shade-axial",   P("shade-axial.pdf"),   0, 3.0, "axial gradient (sh, type-2 fn)"),
+    ("shade-radial",  P("shade-radial.pdf"),  0, 3.0, "radial gradient (sh, blends-of-circles)"),
+    ("shade-stitch",  P("shade-stitch.pdf"),  0, 3.0, "axial + stitching fn (type-3)"),
+    ("shade-pattern", P("shade-pattern.pdf"), 0, 3.0, "shading pattern fill (PatternType 2)"),
+    ("shade-sampled", P("shade-sampled.pdf"), 0, 3.0, "axial + sampled fn (type-0)"),
+    ("shade-ps",      P("shade-ps.pdf"),      0, 3.0, "axial + PostScript-calc fn (type-4)"),
+    ("shade-smask",   P("shade-smask.pdf"),   0, 3.0, "gradient under a soft-mask group"),
 ]
 REAL = [
     ("arxiv-p0",   P("real-arxiv.pdf"),          0, 1.5, "academic paper (title)"),

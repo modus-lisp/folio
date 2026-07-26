@@ -43,7 +43,11 @@
   (rise 0d0)                            ; Ts
   ;; ---- constant alpha from ExtGState (§11.6.4.4) ----
   (fill-alpha 1d0)                      ; ca  (non-stroking alpha)
-  (stroke-alpha 1d0))                   ; CA  (stroking alpha)
+  (stroke-alpha 1d0)                    ; CA  (stroking alpha)
+  ;; ---- pattern colour (§8.7): the pattern object selected by scn/SCN under a
+  ;; Pattern colour space (a shading pattern paints a gradient into the filled path) ----
+  (fill-pattern nil)
+  (stroke-pattern nil))
 
 (defun copy-gstate2 (s)
   (let ((n (%copy-gstate2 s)))
@@ -56,6 +60,8 @@
   (gstack nil)                          ; stack of saved gstate2 (parallel to gesso)
   resources                             ; the page /Resources dict (fonts/xobjects)
   doc                                   ; owning document (for resolving indirects)
+  base-ctm                              ; the page base CTM (default coord system;
+                                        ; shading patterns map pattern space through it)
   ;; pending clip: NIL, :nonzero or :evenodd, applied AFTER the next paint op
   (pending-clip nil)
   ;; text object state (§9.4): the text matrix and the text-line matrix, valid
@@ -234,9 +240,17 @@ the path.  CLOSE closes the current subpath first; FILL / STROKE select ops."
   (let ((ctx (interp-ctx ip)) (s (interp-state ip)))
     (when close (gesso:close-path ctx))
     (when fill
-      (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
-      (gesso:set-fill-rule ctx fill-rule)
-      (gesso:fill-path ctx))
+      (let ((pat (and (eq (gstate2-fill-space s) :pattern)
+                      (gstate2-fill-pattern s)
+                      (shading-pattern-obj (interp-doc ip) (gstate2-fill-pattern s)))))
+        (if pat
+            ;; a shading pattern: paint its gradient clipped to the path (the path
+            ;; is left intact for a following stroke / pending clip)
+            (fill-with-shading-pattern ip pat fill-rule)
+            (progn
+              (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
+              (gesso:set-fill-rule ctx fill-rule)
+              (gesso:fill-path ctx)))))
     (when stroke
       (gesso:set-global-alpha ctx (gstate2-stroke-alpha s))
       (apply-line-width ip)
@@ -396,7 +410,7 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
 
         ;; ---- XObjects (§8.10) ----
         ((string= kw "Do") (op-do ip (a 0)))   ; Form / Image XObjects
-        ((string= kw "sh") nil)          ; shading fills
+        ((string= kw "sh") (op-sh ip (a 0)))    ; shading fills (§8.7.4.5)
 
         ;; ---- marked content / compatibility — no-op ----
         ((member kw '("BMC" "BDC" "EMC" "BX" "EX" "MP" "DP") :test #'string=) nil)
@@ -496,24 +510,37 @@ the soft mask /SMask (§11.6.5.2).  Transfer functions are still deferred."
         (s (interp-state ip)) (ctx (interp-ctx ip)))
     (multiple-value-bind (kind base) (resolve-color-space ip name)
       (if (eq which :fill)
-          (setf (gstate2-fill-space s) kind (gstate2-fill-base s) base)
-          (setf (gstate2-stroke-space s) kind (gstate2-stroke-base s) base))
+          (setf (gstate2-fill-space s) kind (gstate2-fill-base s) base
+                (gstate2-fill-pattern s) nil)
+          (setf (gstate2-stroke-space s) kind (gstate2-stroke-base s) base
+                (gstate2-stroke-pattern s) nil))
       ;; initial colour: black (0 for additive, full ink for subtractive)
       (let ((c (case kind (:cmyk '(0 0 0)) (t '(0 0 0)))))
         (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c))))))
 
 (defun op-set-color (ip args which)
-  "Handle sc/scn/SC/SCN under the current colour space.  A trailing name operand
-(pattern) with no numeric components paints a mid-grey placeholder (M-later)."
+  "Handle sc/scn/SC/SCN under the current colour space.  Under a Pattern space, a
+trailing name operand selects a pattern: a shading pattern is painted as a gradient
+when the path is filled (do-paint), so here we just record it and set a
+representative solid colour as a fallback (used for strokes / tiling patterns)."
   (let* ((s (interp-state ip)) (ctx (interp-ctx ip))
          (kind (if (eq which :fill) (gstate2-fill-space s) (gstate2-stroke-space s)))
          (base (if (eq which :fill) (gstate2-fill-base s) (gstate2-stroke-base s)))
          (nums (remove-if-not #'numberp args))
-         (has-name (some #'pdf-name-p args)))
-    (let ((c (cond ((and has-name (null nums)) '(128 128 128)) ; pattern placeholder
-                   ((eq kind :pattern) '(128 128 128))
-                   (t (interpret-color kind base nums)))))
-      (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c)))))
+         (name-arg (find-if #'pdf-name-p args)))
+    (cond
+      ((and (eq kind :pattern) name-arg)
+       (let* ((pat (resolve-pattern ip (pdf-name-string name-arg)))
+              (c (or (ignore-errors (shading-pattern-average ip pat)) '(128 128 128))))
+         (if (eq which :fill)
+             (setf (gstate2-fill-pattern s) pat)
+             (setf (gstate2-stroke-pattern s) pat))
+         (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c))))
+      (t
+       (if (eq which :fill) (setf (gstate2-fill-pattern s) nil)
+           (setf (gstate2-stroke-pattern s) nil))
+       (let ((c (if (eq kind :pattern) '(128 128 128) (interpret-color kind base nums))))
+         (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c)))))))
 
 ;;; ---- text (§9): font selection, positioning, glyph painting ---------------
 

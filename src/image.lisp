@@ -162,6 +162,7 @@ canvas size and CTM.  Returns the array, or NIL on failure."
            (oip (make-interp :ctx off
                              :state (%make-gstate2 :ctm ctm)
                              :resources (interp-resources ip)
+                             :base-ctm (interp-base-ctm ip)
                              :doc doc
                              :font-cache (interp-font-cache ip)
                              :form-depth (interp-form-depth ip)
