@@ -18,5 +18,7 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF.  Milestone 0: the parse
                              (:file "filters")
                              (:file "xref")
                              (:file "doc")
+                             (:file "enc-data")
+                             (:file "font")
                              (:file "content")
                              (:file "render")))))

@@ -5,3 +5,6 @@
 *~
 .#*
 test/real-*.pdf
+test/out-*.png
+test/pdfium-*.png
+test/chrome-*.png

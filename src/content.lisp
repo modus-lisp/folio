@@ -31,7 +31,16 @@
   (fill-space :gray)                    ; :gray :rgb :cmyk :other
   (stroke-space :gray)
   (fill-base nil)                       ; for Indexed: (base-space . lookup-bytes)
-  (stroke-base nil))
+  (stroke-base nil)
+  ;; ---- text state (ISO 32000-1 §9.3), part of the graphics state ----
+  (char-spacing 0d0)                    ; Tc  (unscaled text-space units)
+  (word-spacing 0d0)                    ; Tw
+  (h-scale 1d0)                         ; Th = Tz/100
+  (leading 0d0)                         ; TL
+  (font nil)                            ; selected PDF-FONT (or NIL)
+  (font-size 0d0)                       ; Tfs
+  (render-mode 0)                       ; Tr (0..7)
+  (rise 0d0))                           ; Ts
 
 (defun copy-gstate2 (s)
   (let ((n (%copy-gstate2 s)))
@@ -46,8 +55,12 @@
   doc                                   ; owning document (for resolving indirects)
   ;; pending clip: NIL, :nonzero or :evenodd, applied AFTER the next paint op
   (pending-clip nil)
-  ;; text object state (parsed, not yet rendered — Milestone 2)
-  (in-text nil))
+  ;; text object state (§9.4): the text matrix and the text-line matrix, valid
+  ;; between BT and ET (both reset to identity by BT).
+  (in-text nil)
+  (tm (gesso:mat-identity))             ; text matrix Tm
+  (tlm (gesso:mat-identity))            ; text-line matrix Tlm
+  (font-cache (make-hash-table :test 'eq))) ; font-dict -> PDF-FONT
 
 ;;; ---- numeric coercion -----------------------------------------------------
 (declaim (inline num))
@@ -293,12 +306,6 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
       (t (pdf-null)))))
 
 ;;; ---- the main loop --------------------------------------------------------
-(defparameter *text-ops*
-  '("BT" "ET" "Td" "TD" "Tm" "T*" "Tc" "Tw" "Tz" "TL" "Tf" "Tr" "Ts"
-    "Tj" "TJ" "'" "\"" "d0" "d1")
-  "Text-showing / text-state operators (ISO 32000-1 §9).  Parsed but not painted
-until Milestone 2; their operands are consumed and discarded here.")
-
 (defun run-content (ip bytes)
   "Interpret the operator stream BYTES against interpreter IP."
   (let ((lx (make-lexer bytes))
@@ -401,10 +408,39 @@ until Milestone 2; their operands are consumed and discarded here.")
         ;; ---- marked content / compatibility — no-op ----
         ((member kw '("BMC" "BDC" "EMC" "BX" "EX" "MP" "DP") :test #'string=) nil)
 
-        ;; ---- text (§9): parsed, not rendered until Milestone 2 ----
-        ((member kw *text-ops* :test #'string=)
-         (cond ((string= kw "BT") (setf (interp-in-text ip) t))
-               ((string= kw "ET") (setf (interp-in-text ip) nil))))
+        ;; ---- text objects + state (§9.4, §9.3) ----
+        ((string= kw "BT") (setf (interp-in-text ip) t
+                                 (interp-tm ip) (gesso:mat-identity)
+                                 (interp-tlm ip) (gesso:mat-identity)))
+        ((string= kw "ET") (setf (interp-in-text ip) nil))
+        ((string= kw "Tc") (setf (gstate2-char-spacing s) (num (a 0))))
+        ((string= kw "Tw") (setf (gstate2-word-spacing s) (num (a 0))))
+        ((string= kw "Tz") (setf (gstate2-h-scale s) (/ (num (a 0)) 100d0)))
+        ((string= kw "TL") (setf (gstate2-leading s) (num (a 0))))
+        ((string= kw "Ts") (setf (gstate2-rise s) (num (a 0))))
+        ((string= kw "Tr") (setf (gstate2-render-mode s) (round (num (a 0)))))
+        ((string= kw "Tf") (op-set-font ip (a 0) (num (a 1))))
+        ;; ---- text positioning (§9.4.2) ----
+        ((string= kw "Td") (op-text-move ip (num (a 0)) (num (a 1))))
+        ((string= kw "TD") (setf (gstate2-leading s) (- (num (a 1))))
+         (op-text-move ip (num (a 0)) (num (a 1))))
+        ((string= kw "Tm")
+         (let ((m (list (num (a 0)) (num (a 1)) (num (a 2))
+                        (num (a 3)) (num (a 4)) (num (a 5)))))
+           (setf (interp-tm ip) m (interp-tlm ip) (copy-list m))))
+        ((string= kw "T*") (op-text-move ip 0d0 (- (gstate2-leading s))))
+        ;; ---- text showing (§9.4.3) ----
+        ((string= kw "Tj") (when (pdf-string-p (a 0)) (show-text ip (pdf-string-bytes (a 0)))))
+        ((string= kw "TJ") (op-show-tj ip (a 0)))
+        ((string= kw "'")
+         (op-text-move ip 0d0 (- (gstate2-leading s)))
+         (when (pdf-string-p (a 0)) (show-text ip (pdf-string-bytes (a 0)))))
+        ((string= kw "\"")
+         (setf (gstate2-word-spacing s) (num (a 0))
+               (gstate2-char-spacing s) (num (a 1)))
+         (op-text-move ip 0d0 (- (gstate2-leading s)))
+         (when (pdf-string-p (a 2)) (show-text ip (pdf-string-bytes (a 2)))))
+        ((or (string= kw "d0") (string= kw "d1")) nil) ; Type3 glyph metrics
 
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
@@ -433,3 +469,122 @@ until Milestone 2; their operands are consumed and discarded here.")
                    ((eq kind :pattern) '(128 128 128))
                    (t (interpret-color kind base nums)))))
       (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c)))))
+
+;;; ---- text (§9): font selection, positioning, glyph painting ---------------
+
+(defun op-set-font (ip name-obj size)
+  "Tf: select the font named NAME-OBJ from /Resources /Font and set its size."
+  (let* ((s (interp-state ip))
+         (name (and (pdf-name-p name-obj) (pdf-name-string name-obj))))
+    (setf (gstate2-font-size s) (num size))
+    (when name
+      (let* ((doc (interp-doc ip))
+             (fonts (and (interp-resources ip)
+                         (resolve doc (dict-get (interp-resources ip) "Font"))))
+             (fref (and (hash-table-p fonts) (dict-get fonts name)))
+             (fdict (and fref (resolve doc fref))))
+        (when (hash-table-p fdict)
+          (setf (gstate2-font s)
+                (or (gethash fdict (interp-font-cache ip))
+                    (setf (gethash fdict (interp-font-cache ip))
+                          (load-simple-font doc fdict)))))))))
+
+(defun op-text-move (ip tx ty)
+  "Td: Tlm <- translate(tx,ty) x Tlm ; Tm <- Tlm."
+  (let ((new (gesso:mat-mul (interp-tlm ip) (gesso:mat-translate tx ty))))
+    (setf (interp-tlm ip) new (interp-tm ip) (copy-list new))))
+
+(defun op-show-tj (ip items)
+  "TJ: show strings, with numeric elements adjusting the pen (kerning).  A number
+n moves the pen left by n/1000 * Tfs * Th of text space."
+  (let ((s (interp-state ip)))
+    (when (or (listp items) (pdf-array-p items))
+      (map nil
+           (lambda (el)
+             (cond
+               ((pdf-string-p el) (show-text ip (pdf-string-bytes el)))
+               ((numberp el)
+                (let ((tx (* (* (/ (- (float el 1d0)) 1000d0) (gstate2-font-size s))
+                             (gstate2-h-scale s))))
+                  (setf (interp-tm ip)
+                        (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))
+           items))))
+
+(defun glyph-render-matrix (ip font)
+  "The glyph-space (scribe font units) -> user-space matrix: scale by 1/upem into
+text space, apply the text-space parameters [Tfs*Th 0 0 Tfs 0 Trise], then Tm.
+gesso then maps user space through the CTM to device pixels."
+  (let* ((s (interp-state ip))
+         (fs (gstate2-font-size s))
+         (param (list (* fs (gstate2-h-scale s)) 0d0 0d0 fs 0d0 (gstate2-rise s)))
+         (upem (max 1d0 (pdf-font-upem font)))
+         (scale (gesso:mat-scale (/ 1d0 upem) (/ 1d0 upem))))
+    (gesso:mat-mul (gesso:mat-mul (interp-tm ip) param) scale)))
+
+(defun paint-glyph (ip font gid)
+  "Fill/stroke GID's outline in the current text render mode.  Mode 3 (and clip-
+only mode 7) paint nothing — this is what keeps a scanned page's invisible OCR
+text layer from garbaging the image."
+  (let* ((s (interp-state ip)) (ctx (interp-ctx ip))
+         (mode (gstate2-render-mode s)))
+    (when (member mode '(3 7)) (return-from paint-glyph)) ; invisible / clip-only
+    (when (zerop gid) (return-from paint-glyph))           ; .notdef: paint nothing
+    (let ((contours (font-glyph-contours font gid)))
+      (when contours
+        (let ((g (glyph-render-matrix ip font)))
+          (gesso:begin-path ctx)
+          (dolist (c contours)
+            (dolist (seg c)
+              (ecase (car seg)
+                (:move (multiple-value-bind (x y) (gesso:mat-apply g (second seg) (third seg))
+                         (gesso:move-to ctx x y)))
+                (:line (multiple-value-bind (x y) (gesso:mat-apply g (second seg) (third seg))
+                         (gesso:line-to ctx x y)))
+                (:quad (multiple-value-bind (cx cy) (gesso:mat-apply g (second seg) (third seg))
+                         (multiple-value-bind (x y) (gesso:mat-apply g (fourth seg) (fifth seg))
+                           (gesso:quadratic-curve-to ctx cx cy x y))))
+                (:cubic (multiple-value-bind (c1x c1y) (gesso:mat-apply g (second seg) (third seg))
+                          (multiple-value-bind (c2x c2y) (gesso:mat-apply g (fourth seg) (fifth seg))
+                            (multiple-value-bind (x y) (gesso:mat-apply g (sixth seg) (nth 6 seg))
+                              (gesso:bezier-curve-to ctx c1x c1y c2x c2y x y))))))))
+          (gesso:close-path ctx)
+          (when (member mode '(0 2 4 6))        ; fill variants
+            (gesso:set-fill-rule ctx :nonzero)
+            (gesso:fill-path ctx))
+          (when (member mode '(1 2 5 6))        ; stroke variants
+            (apply-line-width ip)
+            (gesso:stroke-path ctx))
+          (gesso:begin-path ctx))))))
+
+(defun show-text (ip bytes)
+  "Show a byte string: for each code, paint its glyph at the text render matrix
+and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
+  (let* ((s (interp-state ip)) (font (gstate2-font s)))
+    (unless (and font (pdf-font-face font) (not (pdf-font-type3 font)))
+      ;; no drawable face (e.g. Type3 or a failed load): still advance the pen so
+      ;; following text lands correctly, using widths if present.
+      (when (and font (plusp (length bytes)))
+        (advance-only ip font bytes))
+      (return-from show-text))
+    (let ((fs (gstate2-font-size s))
+          (tc (gstate2-char-spacing s))
+          (tw (gstate2-word-spacing s))
+          (th (gstate2-h-scale s)))
+      (loop for code across bytes do
+        (let* ((gid (font-code->gid font code))
+               (w0 (/ (font-code-width font code) 1000d0)))
+          (paint-glyph ip font gid)
+          (let ((tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
+            (setf (interp-tm ip)
+                  (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))))
+
+(defun advance-only (ip font bytes)
+  "Advance Tm across BYTES without painting (font has no drawable face)."
+  (let* ((s (interp-state ip)) (fs (gstate2-font-size s))
+         (tc (gstate2-char-spacing s)) (tw (gstate2-word-spacing s))
+         (th (gstate2-h-scale s)))
+    (loop for code across bytes do
+      (let* ((w0 (/ (font-code-width font code) 1000d0))
+             (tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
+        (setf (interp-tm ip)
+              (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))
