@@ -1,0 +1,435 @@
+;;;; src/image.lisp — XObjects (§8.10) and images (§8.9): the `Do` operator, form
+;;;; XObject recursion, image XObjects, and inline images (BI ... ID <bytes> EI).
+;;;;
+;;;; A form XObject is a self-contained content stream: `Do` saves the graphics
+;;;; state, concatenates the form's /Matrix onto the CTM, intersects the clip with
+;;;; the form's /BBox, switches the resource scope to the form's /Resources, and
+;;;; recurses the interpreter on the form's decoded bytes (with a depth limit and a
+;;;; visited-set so a self-referential form cannot loop).  An image XObject (and an
+;;;; inline image) is decoded to straight-alpha RGBA — filter (Flate already done
+;;;; by the parser, DCT via pigment's JPEG decoder; JPX/CCITT/JBIG2 deferred),
+;;;; colour space (Gray/RGB/CMYK/Indexed/ICCBased/Separation), bit depth, /Decode,
+;;;; /ImageMask stencil, /SMask + /Mask alpha — then painted by mapping the unit
+;;;; square through the CTM (gesso:draw-image-rgba, so rotation/skew are handled).
+
+(in-package #:folio)
+
+(defparameter *form-depth-limit* 15
+  "Maximum nesting of form XObjects (a guard against pathological documents; the
+visited-set already breaks true reference cycles).")
+
+(defparameter *deferred-image-filters* nil
+  "Bound per render to collect the names of image filters we could not decode
+(JPXDecode / CCITTFaxDecode / JBIG2Decode) so the caller can report them.")
+
+;;; ---- dict access with inline-image key abbreviations ----------------------
+(defun img-dget (doc dict full abbr)
+  "Fetch DICT[FULL] or its inline-image abbreviation DICT[ABBR], resolved."
+  (let ((v (or (dict-get dict full) (and abbr (dict-get dict abbr)))))
+    (if v (resolve doc v) nil)))
+
+;;; ---- Do dispatch ----------------------------------------------------------
+(defun op-do (ip name-obj)
+  "Execute `Do /Name`: look /Name up in /Resources /XObject and dispatch on its
+/Subtype (Form -> recurse, Image -> paint)."
+  (let* ((doc (interp-doc ip))
+         (name (and (pdf-name-p name-obj) (pdf-name-string name-obj))))
+    (when name
+      (let* ((xobjs (and (interp-resources ip)
+                         (resolve doc (dict-get (interp-resources ip) "XObject"))))
+             (xref (and (hash-table-p xobjs) (dict-get xobjs name)))
+             (xobj (and xref (resolve doc xref))))
+        (when (pdf-stream-p xobj)
+          (let* ((d (pdf-stream-dict xobj))
+                 (st (resolve doc (dict-get d "Subtype")))
+                 (sub (and (pdf-name-p st) (pdf-name-string st))))
+            (cond
+              ((equal sub "Form")  (do-form-xobject ip xobj))
+              ((equal sub "Image") (draw-image-xobject ip xobj))
+              ;; some producers omit /Subtype: guess from the keys present
+              ((dict-get d "BBox")  (do-form-xobject ip xobj))
+              ((dict-get d "Width") (draw-image-xobject ip xobj))
+              (t nil))))))))
+
+;;; ---- form XObjects (§8.10.1) ----------------------------------------------
+(defun mat-from-array (doc v)
+  "A /Matrix array -> a gesso 6-tuple, or NIL if absent/malformed."
+  (let ((a (resolve doc v)))
+    (when (and (pdf-array-p a) (>= (length a) 6))
+      (list (num (resolve doc (aref a 0))) (num (resolve doc (aref a 1)))
+            (num (resolve doc (aref a 2))) (num (resolve doc (aref a 3)))
+            (num (resolve doc (aref a 4))) (num (resolve doc (aref a 5)))))))
+
+(defun clip-to-rect (ctx x0 y0 x1 y1)
+  "Intersect the clip with the user-space rectangle (X0 Y0 X1 Y1)."
+  (gesso:begin-path ctx)
+  (gesso:move-to ctx x0 y0) (gesso:line-to ctx x1 y0)
+  (gesso:line-to ctx x1 y1) (gesso:line-to ctx x0 y1) (gesso:close-path ctx)
+  (gesso:clip ctx)
+  (gesso:begin-path ctx))
+
+(defun do-form-xobject (ip xobj)
+  "Render a /Subtype /Form XObject: q, concat /Matrix, clip to /BBox, switch to
+the form's /Resources, recurse on its content, Q.  Guarded against cycles."
+  (when (or (>= (interp-form-depth ip) *form-depth-limit*)
+            (member xobj (interp-form-stack ip) :test #'eq))
+    (return-from do-form-xobject))
+  (let* ((doc (interp-doc ip))
+         (ctx (interp-ctx ip))
+         (d (pdf-stream-dict xobj))
+         (matrix (mat-from-array doc (dict-get d "Matrix")))
+         (bbox (let ((b (resolve doc (dict-get d "BBox"))))
+                 (when (and (pdf-array-p b) (= (length b) 4))
+                   (mapcar (lambda (x) (num (resolve doc x))) (coerce b 'list)))))
+         (fres (let ((r (resolve doc (dict-get d "Resources"))))
+                 (if (hash-table-p r) r (interp-resources ip))))
+         (saved-res (interp-resources ip)))
+    (op-save ip)                         ; q
+    (when matrix (apply #'op-cm ip matrix))
+    (when bbox
+      (destructuring-bind (x0 y0 x1 y1) bbox
+        (clip-to-rect ctx (min x0 x1) (min y0 y1) (max x0 x1) (max y0 y1))))
+    (setf (interp-resources ip) fres)
+    (push xobj (interp-form-stack ip))
+    (incf (interp-form-depth ip))
+    (let ((bytes (ignore-errors (decode-stream xobj :resolver (lambda (v) (resolve doc v))))))
+      (when bytes (ignore-errors (run-content ip bytes))))
+    (decf (interp-form-depth ip))
+    (pop (interp-form-stack ip))
+    (setf (interp-resources ip) saved-res)
+    (op-restore ip)))                    ; Q
+
+;;; ---- image colour space ---------------------------------------------------
+(defun image-color-space (ip csobj)
+  "Resolve an image ColorSpace object to (values kind ncomp base).  KIND is one of
+:gray :rgb :cmyk :indexed :separation.  NCOMP is the samples-per-pixel.  BASE, for
+:indexed, is (list base-kind base-ncomp lut-bytes)."
+  (let ((doc (interp-doc ip)))
+    (setf csobj (resolve doc csobj))
+    (cond
+      ((null csobj) (values :gray 1 nil))
+      ((pdf-name-p csobj)
+       (let ((s (pdf-name-string csobj)))
+         (cond
+           ((member s '("DeviceGray" "G" "CalGray") :test #'string=) (values :gray 1 nil))
+           ((member s '("DeviceRGB" "RGB" "CalRGB" "Lab") :test #'string=) (values :rgb 3 nil))
+           ((member s '("DeviceCMYK" "CMYK") :test #'string=) (values :cmyk 4 nil))
+           (t ;; a named colour space in /Resources /ColorSpace
+            (let* ((csd (and (interp-resources ip)
+                             (resolve doc (dict-get (interp-resources ip) "ColorSpace"))))
+                   (spec (and (hash-table-p csd) (dict-get csd s))))
+              (if spec (image-color-space ip spec) (values :gray 1 nil)))))))
+      ((pdf-array-p csobj)
+       (let ((head (and (plusp (length csobj)) (resolve doc (aref csobj 0)))))
+         (if (pdf-name-p head)
+             (let ((s (pdf-name-string head)))
+               (cond
+                 ((string= s "ICCBased")
+                  (let* ((strm (resolve doc (aref csobj 1)))
+                         (n (and (pdf-stream-p strm)
+                                 (resolve doc (dict-get (pdf-stream-dict strm) "N")))))
+                    (case n (1 (values :gray 1 nil)) (4 (values :cmyk 4 nil))
+                          (t (values :rgb 3 nil)))))
+                 ((member s '("CalRGB" "Lab") :test #'string=) (values :rgb 3 nil))
+                 ((string= s "CalGray") (values :gray 1 nil))
+                 ((string= s "Separation") (values :separation 1 nil))
+                 ((string= s "DeviceN")
+                  (let ((names (resolve doc (aref csobj 1))))
+                    (values :separation (if (pdf-array-p names) (length names) 1) nil)))
+                 ((or (string= s "Indexed") (string= s "I"))
+                  (multiple-value-bind (bk bn) (image-color-space ip (aref csobj 1))
+                    (let* ((lut (resolve doc (aref csobj 3)))
+                           (bytes (cond ((pdf-string-p lut) (pdf-string-bytes lut))
+                                        ((pdf-stream-p lut)
+                                         (ignore-errors
+                                          (decode-stream lut :resolver (lambda (v) (resolve doc v)))))
+                                        (t nil))))
+                      (values :indexed 1 (list bk bn bytes)))))
+                 (t (values :rgb 3 nil))))
+             (values :rgb 3 nil))))
+      (t (values :gray 1 nil)))))
+
+;;; ---- sample unpacking -----------------------------------------------------
+(declaim (inline sample-ref))
+(defun sample-ref (bytes row-bytes row col ncomp comp bpc)
+  "Fetch one BPC-bit sample at pixel (ROW,COL) component COMP, row-major with rows
+padded to a byte boundary.  Returns an integer 0..(2^BPC - 1)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (fixnum row-bytes row col ncomp comp bpc))
+  (let* ((base (the fixnum (* row row-bytes))))
+    (case bpc
+      (8 (let ((i (+ base (* (+ (* col ncomp) comp)))))
+           (if (< i (length bytes)) (aref bytes i) 0)))
+      (16 (let ((i (+ base (* 2 (+ (* col ncomp) comp)))))
+            (if (< (1+ i) (length bytes))
+                (logior (ash (aref bytes i) 8) (aref bytes (1+ i))) 0)))
+      (t ;; 1/2/4 bit
+       (let* ((bit (* (+ (* col ncomp) comp) bpc))
+              (bi (+ base (floor bit 8))))
+         (if (< bi (length bytes))
+             (let* ((within (mod bit 8))
+                    (shift (- 8 within bpc))
+                    (mask (1- (ash 1 bpc))))
+               (logand (ash (aref bytes bi) (- shift)) mask))
+             0))))))
+
+(defun decode-map (s maxval dmin dmax)
+  "Map sample S (0..MAXVAL) to [DMIN,DMAX] per a /Decode entry (0..1 by default)."
+  (+ dmin (* (- dmax dmin) (/ (float s 1d0) (float maxval 1d0)))))
+
+;;; ---- image XObject / inline image core ------------------------------------
+(defun decode-image-to-rgba (ip dict data left)
+  "Turn a filter-decoded image (DATA octets, LEFT = trailing undecoded filters)
+described by DICT into a straight-alpha RGBA vector.  Returns (values rgba w h)
+or NIL if the image cannot be produced (deferred codec, etc.)."
+  (let* ((doc (interp-doc ip))
+         (w (let ((x (img-dget doc dict "Width" "W"))) (and x (round (num x)))))
+         (h (let ((x (img-dget doc dict "Height" "H"))) (and x (round (num x)))))
+         (mask? (let ((v (img-dget doc dict "ImageMask" "IM"))) (or (eq v :true) (eq v t)))))
+    (when (or (null w) (null h) (<= w 0) (<= h 0)) (return-from decode-image-to-rgba nil))
+    ;; deferred image codecs (JPX/CCITT/JBIG2): note and skip.  DCT is handled by
+    ;; the caller (it needs the raw JPEG bytes, not the unpacked samples).
+    (when left
+      (let ((f (car left)))
+        (unless (member f '("DCTDecode" "DCT") :test #'string=)
+          (pushnew f *deferred-image-filters* :test #'string=)
+          (return-from decode-image-to-rgba nil))))
+    (let* ((bpc (if mask? 1 (let ((b (img-dget doc dict "BitsPerComponent" "BPC")))
+                              (if b (round (num b)) 8))))
+           (decode (let ((a (img-dget doc dict "Decode" "D")))
+                     (when (pdf-array-p a)
+                       (map 'list (lambda (x) (num (resolve doc x))) a))))
+           (rgba (make-array (* w h 4) :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+      (declare (type (simple-array (unsigned-byte 8) (*)) rgba))
+      (unless (typep data '(simple-array (unsigned-byte 8) (*)))
+        (setf data (coerce data '(simple-array (unsigned-byte 8) (*)))))
+      (cond
+        ;; ---- 1-bit stencil mask (§8.9.6.2): paint the current fill colour ----
+        (mask?
+         (let* ((row-bytes (ceiling w 8))
+                (fill (gesso:current-fill (interp-ctx ip)))
+                (fr (first fill)) (fg (second fill)) (fb (third fill))
+                ;; default Decode [0 1]: a decoded value of 0 is PAINTED
+                (paint-on-zero (or (null decode) (< (first decode) (second decode)))))
+           (dotimes (row h)
+             (dotimes (col w)
+               (let* ((s (sample-ref data row-bytes row col 1 0 1))
+                      (painted (if paint-on-zero (= s 0) (= s 1)))
+                      (o (* 4 (+ (* row w) col))))
+                 (when painted
+                   (setf (aref rgba o) fr (aref rgba (+ o 1)) fg
+                         (aref rgba (+ o 2)) fb (aref rgba (+ o 3)) 255)))))))
+        ;; ---- ordinary sampled image ----
+        (t
+         (multiple-value-bind (kind ncomp base)
+             (image-color-space ip (img-dget doc dict "ColorSpace" "CS"))
+           (let* ((row-bytes (ceiling (* w ncomp bpc) 8))
+                  (maxval (1- (ash 1 bpc)))
+                  (comps (make-array (max 4 ncomp))))
+             (declare (type (simple-array t (*)) comps))
+             (dotimes (row h)
+               (dotimes (col w)
+                 (dotimes (k ncomp)
+                   (setf (aref comps k) (sample-ref data row-bytes row col ncomp k bpc)))
+                 (multiple-value-bind (r g b)
+                     (image-pixel-rgb kind base comps ncomp maxval decode)
+                   (let ((o (* 4 (+ (* row w) col))))
+                     (setf (aref rgba o) r (aref rgba (+ o 1)) g
+                           (aref rgba (+ o 2)) b (aref rgba (+ o 3)) 255)))))))))
+      ;; ---- soft mask / stencil mask alpha ----
+      (apply-soft-mask ip dict rgba w h)
+      (values rgba w h))))
+
+(defun image-pixel-rgb (kind base comps ncomp maxval decode)
+  "Convert the NCOMP integer samples in COMPS (0..MAXVAL) to (values r g b)."
+  (flet ((cv (k) ;; component K as a 0..1 float, honouring /Decode
+           (let ((s (aref comps k)))
+             (if decode
+                 (decode-map s maxval (nth (* 2 k) decode) (nth (1+ (* 2 k)) decode))
+                 (/ (float s 1d0) (float maxval 1d0)))))
+         (b8 (x) (max 0 (min 255 (round (* 255d0 x))))))
+    (case kind
+      (:gray (let ((v (b8 (cv 0)))) (values v v v)))
+      (:rgb (values (b8 (cv 0)) (b8 (cv 1)) (b8 (cv 2))))
+      (:cmyk (let ((rgb (cmyk->rgb (cv 0) (cv 1) (cv 2) (cv 3))))
+               (values (first rgb) (second rgb) (third rgb))))
+      (:separation (let ((v (b8 (- 1d0 (cv 0))))) (values v v v)))
+      (:indexed
+       (destructuring-bind (bk bn lut) base
+         (let* ((idx (aref comps 0))       ; palette index = raw sample
+                (bn (or bn (components-per (or bk :rgb)))))
+           (if (and lut (<= (* (1+ idx) bn) (length lut)))
+               (let ((rgb (interpret-color (or bk :rgb) nil
+                                           (loop for i below bn
+                                                 collect (/ (aref lut (+ (* idx bn) i)) 255d0)))))
+                 (values (first rgb) (second rgb) (third rgb)))
+               (values 0 0 0)))))
+      (t ;; unknown: best effort by component count
+       (case ncomp
+         (1 (let ((v (b8 (cv 0)))) (values v v v)))
+         (3 (values (b8 (cv 0)) (b8 (cv 1)) (b8 (cv 2))))
+         (4 (let ((rgb (cmyk->rgb (cv 0) (cv 1) (cv 2) (cv 3))))
+              (values (first rgb) (second rgb) (third rgb))))
+         (t (values 0 0 0)))))))
+
+;;; ---- soft-mask / mask alpha (§11.6.5.2, §8.9.6.3) --------------------------
+(defun apply-soft-mask (ip dict rgba w h)
+  "If DICT carries an /SMask (grayscale alpha) or a stencil /Mask, resample it to
+W x H and fold it into the RGBA alpha channel."
+  (let* ((doc (interp-doc ip))
+         (sm (resolve doc (dict-get dict "SMask")))
+         (mk (resolve doc (dict-get dict "Mask"))))
+    (cond
+      ((pdf-stream-p sm) (fold-mask ip rgba w h sm nil))
+      ((pdf-stream-p mk) (fold-mask ip rgba w h mk t))
+      ;; colour-key masking (/Mask array): minimal — left unhandled beyond note
+      (t nil))))
+
+(defun fold-mask (ip rgba w h mstream stencil)
+  "Multiply the RGBA alpha by the mask image MSTREAM (resampled to W x H).  When
+STENCIL, MSTREAM is a 1-bit /Mask (sample 1 => hidden per default Decode); else it
+is an /SMask giving alpha directly from its grayscale samples."
+  (let* ((doc (interp-doc ip))
+         (md (pdf-stream-dict mstream)))
+    (multiple-value-bind (mdata left)
+        (decode-stream mstream :resolver (lambda (v) (resolve doc v)))
+      (when left (return-from fold-mask))   ; can't decode the mask's codec
+      (unless (typep mdata '(simple-array (unsigned-byte 8) (*)))
+        (setf mdata (coerce mdata '(simple-array (unsigned-byte 8) (*)))))
+      (let* ((mw (round (num (img-dget doc md "Width" "W"))))
+             (mh (round (num (img-dget doc md "Height" "H"))))
+             (mbpc (if stencil 1 (let ((b (img-dget doc md "BitsPerComponent" "BPC")))
+                                   (if b (round (num b)) 8))))
+             (mmax (1- (ash 1 mbpc)))
+             (mrow (ceiling (* mw mbpc) 8))
+             (decode (let ((a (img-dget doc md "Decode" "D")))
+                       (when (pdf-array-p a)
+                         (map 'list (lambda (x) (num (resolve doc x))) a))))
+             (invert (and stencil decode (> (first decode) (second decode)))))
+        (when (or (<= mw 0) (<= mh 0)) (return-from fold-mask))
+        (dotimes (row h)
+          (let ((mrY (min (1- mh) (floor (* row mh) h))))
+            (dotimes (col w)
+              (let* ((mrX (min (1- mw) (floor (* col mw) w)))
+                     (s (sample-ref mdata mrow mrY mrX 1 0 mbpc))
+                     (o (* 4 (+ (* row w) col)))
+                     (alpha (if stencil
+                                ;; default: sample 1 hides, 0 shows
+                                (if invert (if (= s 1) 255 0) (if (= s 1) 0 255))
+                                (round (* 255d0 (/ (float s 1d0) (float mmax 1d0)))))))
+                (setf (aref rgba (+ o 3))
+                      (round (* (aref rgba (+ o 3)) alpha) 255))))))))))
+
+;;; ---- painting an image XObject --------------------------------------------
+(defun draw-image-xobject (ip xobj)
+  "Decode image XObject XOBJ and paint it through the CTM."
+  (let* ((doc (interp-doc ip))
+         (dict (pdf-stream-dict xobj)))
+    (multiple-value-bind (data left)
+        (decode-stream xobj :resolver (lambda (v) (resolve doc v)))
+      (paint-decoded-image ip dict data left))))
+
+(defun blit-rgba (ip rgba w h)
+  "Draw an RGBA image through the CTM, honouring the current fill constant-alpha."
+  (let ((ctx (interp-ctx ip)))
+    (gesso:set-global-alpha ctx (gstate2-fill-alpha (interp-state ip)))
+    (gesso:draw-image-rgba ctx rgba w h)
+    (gesso:set-global-alpha ctx 1d0)))
+
+(defun paint-decoded-image (ip dict data left)
+  "Shared by image XObjects and inline images: build RGBA (DCT via pigment, else
+sample-unpacked) and blit it through the CTM onto the canvas."
+  (let ((doc (interp-doc ip)))
+    (cond
+      ;; ---- DCTDecode: hand the raw JPEG bytes to pigment ----
+      ((and left (member (car left) '("DCTDecode" "DCT") :test #'string=))
+       (let ((img (ignore-errors (pigment:jpeg-decode
+                                  (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                                      data (coerce data '(simple-array (unsigned-byte 8) (*))))))))
+         (if (typep img 'pigment:img)
+             (let ((rgba (pigment:img-rgba img))
+                   (w (pigment:img-w img)) (h (pigment:img-h img)))
+               ;; a JPEG can carry an /SMask that lives outside the codec
+               (apply-soft-mask ip dict rgba w h)
+               (blit-rgba ip rgba w h))
+             (pushnew "DCTDecode" *deferred-image-filters* :test #'string=))))
+      ;; ---- deferred codecs ----
+      ((and left (member (car left)
+                         '("JPXDecode" "CCITTFaxDecode" "CCF" "JBIG2Decode") :test #'string=))
+       (pushnew (car left) *deferred-image-filters* :test #'string=))
+      ;; ---- Flate/raw samples ----
+      (t
+       (multiple-value-bind (rgba w h) (decode-image-to-rgba ip dict data left)
+         (when rgba
+           (blit-rgba ip rgba w h)))))))
+
+;;; ---- inline images (BI <dict> ID <bytes> EI) ------------------------------
+(defun read-inline-dict (lx)
+  "LX just past BI: read key/value pairs into a name-keyed hash-table, stopping at
+the ID keyword.  Leaves LX positioned just after ID."
+  (let ((h (make-hash-table :test 'equal)))
+    (loop for tok = (lex-next lx)
+          until (or (eq (token-type tok) :eof)
+                    (and (eq (token-type tok) :keyword)
+                         (string= (token-value tok) "ID")))
+          do (when (eq (token-type tok) :name)
+               (setf (gethash (token-value tok) h) (read-one-operand lx))))
+    h))
+
+(defun inline-ncomp (ip dict)
+  "Samples-per-pixel for an inline image (for computing its unfiltered length)."
+  (let ((doc (interp-doc ip)))
+    (if (let ((v (img-dget doc dict "ImageMask" "IM"))) (or (eq v :true) (eq v t)))
+        1
+        (nth-value 1 (image-color-space ip (img-dget doc dict "ColorSpace" "CS"))))))
+
+(defun do-inline-image (ip lx)
+  "Parse an inline image at LX (positioned after BI), paint it, and leave LX just
+past the terminating EI."
+  (let* ((doc (interp-doc ip))
+         (dict (read-inline-dict lx))
+         (buf (lexer-buf lx)) (end (lexer-end lx)) (p (lexer-pos lx)))
+    ;; one whitespace byte separates ID from the binary data
+    (when (and (< p end) (ws-byte-p (aref buf p))) (incf p))
+    (let* ((data-start p)
+           (has-filter (or (dict-get dict "F") (dict-get dict "Filter")))
+           data-end)
+      (if (not has-filter)
+          ;; unfiltered: exact length = rows * ceil(w*ncomp*bpc/8)
+          (let* ((w (round (num (img-dget doc dict "Width" "W"))))
+                 (h (round (num (img-dget doc dict "Height" "H"))))
+                 (mask? (let ((v (img-dget doc dict "ImageMask" "IM")))
+                          (or (eq v :true) (eq v t))))
+                 (bpc (if mask? 1 (let ((b (img-dget doc dict "BitsPerComponent" "BPC")))
+                                    (if b (round (num b)) 8))))
+                 (ncomp (inline-ncomp ip dict))
+                 (row-bytes (ceiling (* w ncomp bpc) 8))
+                 (len (* row-bytes h)))
+            (setf data-end (min end (+ data-start len)))
+            ;; advance past the data and the trailing EI (+ optional whitespace)
+            (let ((q data-end))
+              (loop while (and (< q end) (ws-byte-p (aref buf q))) do (incf q))
+              (when (and (< (1+ q) end) (= (aref buf q) 69) (= (aref buf (1+ q)) 73))
+                (setf q (+ q 2)))
+              (setf (lexer-pos lx) q (lexer-peeked lx) nil)))
+          ;; filtered: scan for a whitespace-delimited EI
+          (progn
+            (loop with q = data-start
+                  while (< (1+ q) end) do
+                    (if (and (= (aref buf q) 69) (= (aref buf (1+ q)) 73) ; E I
+                             (or (= q 0) (ws-byte-p (aref buf (1- q))))
+                             (or (>= (+ q 2) end) (ws-byte-p (aref buf (+ q 2)))
+                                 (delim-byte-p (aref buf (+ q 2)))))
+                        (progn (setf data-end q
+                                     (lexer-pos lx) (+ q 2) (lexer-peeked lx) nil)
+                               (return))
+                        (incf q))
+                  finally (setf data-end end
+                                (lexer-pos lx) end (lexer-peeked lx) nil))))
+      ;; build a stream over the captured bytes and paint it
+      (let* ((raw (subseq buf data-start (or data-end data-start)))
+             (strm (make-pdf-stream dict raw)))
+        (multiple-value-bind (dec left)
+            (ignore-errors (decode-stream strm :resolver (lambda (v) (resolve doc v))))
+          (when dec (paint-decoded-image ip dict dec left)))))))

@@ -22,4 +22,5 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF.  Milestone 0: the parse
                              (:file "cff")
                              (:file "font")
                              (:file "content")
+                             (:file "image")
                              (:file "render")))))

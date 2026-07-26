@@ -40,7 +40,10 @@
   (font nil)                            ; selected PDF-FONT (or NIL)
   (font-size 0d0)                       ; Tfs
   (render-mode 0)                       ; Tr (0..7)
-  (rise 0d0))                           ; Ts
+  (rise 0d0)                            ; Ts
+  ;; ---- constant alpha from ExtGState (§11.6.4.4) ----
+  (fill-alpha 1d0)                      ; ca  (non-stroking alpha)
+  (stroke-alpha 1d0))                   ; CA  (stroking alpha)
 
 (defun copy-gstate2 (s)
   (let ((n (%copy-gstate2 s)))
@@ -60,7 +63,11 @@
   (in-text nil)
   (tm (gesso:mat-identity))             ; text matrix Tm
   (tlm (gesso:mat-identity))            ; text-line matrix Tlm
-  (font-cache (make-hash-table :test 'eq))) ; font-dict -> PDF-FONT
+  (font-cache (make-hash-table :test 'eq)) ; font-dict -> PDF-FONT
+  ;; form-XObject recursion (§8.10.1): a depth counter + a stack of the form
+  ;; streams currently being interpreted, to break reference cycles.
+  (form-depth 0)
+  (form-stack nil))
 
 ;;; ---- numeric coercion -----------------------------------------------------
 (declaim (inline num))
@@ -215,48 +222,25 @@ A user width of 0 means the thinnest device line (1 px), per §8.4.3.2."
 (defun do-paint (ip &key close fill stroke (fill-rule :nonzero))
   "Execute a path-painting operator, then honour a pending W/W* clip and reset
 the path.  CLOSE closes the current subpath first; FILL / STROKE select ops."
-  (let ((ctx (interp-ctx ip)))
+  (let ((ctx (interp-ctx ip)) (s (interp-state ip)))
     (when close (gesso:close-path ctx))
     (when fill
+      (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
       (gesso:set-fill-rule ctx fill-rule)
       (gesso:fill-path ctx))
     (when stroke
+      (gesso:set-global-alpha ctx (gstate2-stroke-alpha s))
       (apply-line-width ip)
       (gesso:stroke-path ctx))
+    (gesso:set-global-alpha ctx 1d0)
     ;; §8.5.4: the clip is intersected AFTER the path is painted.
     (when (interp-pending-clip ip)
       (gesso:clip ctx (interp-pending-clip ip))
       (setf (interp-pending-clip ip) nil))
     (gesso:begin-path ctx)))
 
-;;; ---- inline images (BI ... ID <bytes> EI) — parsed & skipped (M4) ----------
-(defun skip-inline-image (ip lx)
-  "LX is positioned just after the BI keyword.  Consume the parameter dict up to
-ID, then skip the binary sample data up to the terminating EI."
-  (declare (ignore ip))
-  ;; consume key/value tokens until the ID keyword
-  (loop for tok = (lex-next lx)
-        until (or (eq (token-type tok) :eof)
-                  (and (eq (token-type tok) :keyword)
-                       (string= (token-value tok) "ID")))
-        ;; values may be arrays/dicts; skip them structurally
-        do (case (token-type tok)
-             (:array-open (loop for x = (lex-next lx)
-                                until (member (token-type x) '(:array-close :eof))))
-             (:dict-open (loop for x = (lex-next lx)
-                               until (member (token-type x) '(:dict-close :eof))))))
-  ;; the byte after ID is a single whitespace separator; then raw sample data.
-  (let* ((buf (lexer-buf lx)) (end (lexer-end lx)) (p (lexer-pos lx)))
-    (when (and (< p end) (ws-byte-p (aref buf p))) (incf p))
-    ;; scan for a whitespace-delimited EI
-    (loop while (< (+ p 1) end) do
-      (if (and (= (aref buf p) 69) (= (aref buf (+ p 1)) 73) ; E I
-               (or (= p 0) (ws-byte-p (aref buf (1- p))))
-               (or (>= (+ p 2) end) (ws-byte-p (aref buf (+ p 2)))
-                   (delim-byte-p (aref buf (+ p 2)))))
-          (progn (setf (lexer-pos lx) (+ p 2) (lexer-peeked lx) nil) (return))
-          (incf p))
-          finally (setf (lexer-pos lx) end (lexer-peeked lx) nil))))
+;;; Inline images (BI ... ID <bytes> EI) are parsed and painted by DO-INLINE-IMAGE
+;;; in image.lisp (invoked from the main loop's BI branch).
 
 ;;; ---- the operand reader ---------------------------------------------------
 (defun read-operand-array (lx)
@@ -327,7 +311,7 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
                ((string= kw "false") (push :false ops))
                ((string= kw "null") (push (pdf-null) ops))
                ((or (string= kw "{") (string= kw "}")) nil) ; PostScript calc — ignore
-               ((string= kw "BI") (skip-inline-image ip lx) (setf ops '()))
+               ((string= kw "BI") (ignore-errors (do-inline-image ip lx)) (setf ops '()))
                (t (ignore-errors (exec-op ip kw (nreverse ops)))
                   (setf ops '())))))
           (t (setf ops '())))))))
@@ -349,7 +333,7 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
                                 (gstate2-dash-phase s) (num (a 1))))
         ((string= kw "ri") nil)
         ((string= kw "i") nil)
-        ((string= kw "gs") nil)          ; ExtGState (alpha/blend) — M-later
+        ((string= kw "gs") (op-gs ip (a 0)))  ; ExtGState — constant alpha (§11.6.4.4)
 
         ;; ---- path construction ----
         ((string= kw "m") (gesso:move-to ctx (num (a 0)) (num (a 1))))
@@ -401,8 +385,8 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
         ((or (string= kw "sc") (string= kw "scn")) (op-set-color ip args :fill))
         ((or (string= kw "SC") (string= kw "SCN")) (op-set-color ip args :stroke))
 
-        ;; ---- XObjects / shadings — deferred (M4) ----
-        ((string= kw "Do") nil)          ; Form/Image XObjects
+        ;; ---- XObjects (§8.10) ----
+        ((string= kw "Do") (op-do ip (a 0)))   ; Form / Image XObjects
         ((string= kw "sh") nil)          ; shading fills
 
         ;; ---- marked content / compatibility — no-op ----
@@ -444,6 +428,21 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
 
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
+
+(defun op-gs (ip name-obj)
+  "Apply a named graphics-state parameter dict (§8.4.5) from /Resources /ExtGState.
+Only the constant alphas /ca (fill) and /CA (stroke) are honoured; soft masks,
+blend modes and transfer functions are deferred."
+  (let* ((doc (interp-doc ip)) (s (interp-state ip))
+         (name (and (pdf-name-p name-obj) (pdf-name-string name-obj)))
+         (egs (and name (interp-resources ip)
+                   (resolve doc (dict-get (interp-resources ip) "ExtGState"))))
+         (g (and (hash-table-p egs) (resolve doc (dict-get egs name)))))
+    (when (hash-table-p g)
+      (let ((fill-a (resolve doc (dict-get g "ca")))
+            (stroke-a (resolve doc (dict-get g "CA"))))
+        (when (numberp fill-a) (setf (gstate2-fill-alpha s) (max 0d0 (min 1d0 (num fill-a)))))
+        (when (numberp stroke-a) (setf (gstate2-stroke-alpha s) (max 0d0 (min 1d0 (num stroke-a)))))))))
 
 (defun op-set-space (ip name-obj which)
   "Handle cs/CS: select a colour space and reset the colour to its initial value."
@@ -549,11 +548,14 @@ text layer from garbaging the image."
                               (gesso:bezier-curve-to ctx c1x c1y c2x c2y x y))))))))
           (gesso:close-path ctx)
           (when (member mode '(0 2 4 6))        ; fill variants
+            (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
             (gesso:set-fill-rule ctx :nonzero)
             (gesso:fill-path ctx))
           (when (member mode '(1 2 5 6))        ; stroke variants
+            (gesso:set-global-alpha ctx (gstate2-stroke-alpha s))
             (apply-line-width ip)
             (gesso:stroke-path ctx))
+          (gesso:set-global-alpha ctx 1d0)
           (gesso:begin-path ctx))))))
 
 (defun font-drawable-p (font)
