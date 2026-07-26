@@ -99,6 +99,77 @@ the form's /Resources, recurse on its content, Q.  Guarded against cycles."
     (setf (interp-resources ip) saved-res)
     (op-restore ip)))                    ; Q
 
+;;; ---- ExtGState soft masks (§11.6.5.2) -------------------------------------
+;;; A soft mask is a transparency-group form XObject (/G) whose LUMINOSITY (/S
+;;; /Luminosity) or ALPHA (/S /Alpha) becomes a per-pixel alpha applied to every
+;;; mark painted while the mask is active.  We render /G to an offscreen canvas at
+;;; the SAME device resolution and under the SAME CTM in force when `gs` set the
+;;; mask (so it lands registered with the page), then reduce that offscreen to a
+;;; device-space alpha array gesso multiplies into subsequent coverage.
+
+(defun smask-backdrop-rgb (ip mdict)
+  "The luminosity-group backdrop colour /BC (in the group's colour space) as an
+8-bit (r g b); default black (fully masked outside the group)."
+  (let* ((doc (interp-doc ip))
+         (bc (resolve doc (dict-get mdict "BC"))))
+    (if (pdf-array-p bc)
+        (let ((vals (map 'list (lambda (x) (num (resolve doc x))) bc)))
+          (case (length vals)
+            (1 (gray->rgb (first vals)))
+            (3 (rgb255 (first vals) (second vals) (third vals)))
+            (4 (cmyk->rgb (first vals) (second vals) (third vals) (fourth vals)))
+            (t '(0 0 0))))
+        '(0 0 0))))
+
+(defun extract-mask (ctx cw ch alpha-mask)
+  "Reduce the offscreen group render in CTX to a CW*CH device alpha array (0..1):
+the group's accumulated alpha for an /Alpha mask, else per-pixel luminosity
+(0.3R+0.59G+0.11B) for a /Luminosity mask."
+  (let* ((cv (gesso:context-canvas ctx))
+         (n (* cw ch))
+         (arr (make-array n :element-type 'double-float :initial-element 0d0)))
+    (if (and alpha-mask (scribe:canvas-alpha cv))
+        (let ((ap (scribe:canvas-alpha cv)))
+          (dotimes (i n) (setf (aref arr i) (/ (aref ap i) 255d0))))
+        (let ((px (scribe:canvas-pixels cv)))
+          (dotimes (i n)
+            (let ((j (* 3 i)))
+              (setf (aref arr i)
+                    (/ (+ (* 0.30d0 (aref px j))
+                          (* 0.59d0 (aref px (+ j 1)))
+                          (* 0.11d0 (aref px (+ j 2))))
+                       255d0))))))
+    arr))
+
+(defun build-soft-mask (ip mask-dict)
+  "Render the ExtGState /SMask MASK-DICT's transparency group /G to a device-space
+alpha array (0..1) for gesso to multiply into subsequent paint.  Uses the current
+canvas size and CTM.  Returns the array, or NIL on failure."
+  (let* ((doc (interp-doc ip))
+         (ctx (interp-ctx ip))
+         (cv (gesso:context-canvas ctx))
+         (cw (scribe:canvas-width cv)) (ch (scribe:canvas-height cv))
+         (g (resolve doc (dict-get mask-dict "G")))
+         (styp (resolve doc (dict-get mask-dict "S")))
+         (subtype (and (pdf-name-p styp) (pdf-name-string styp)))
+         (alpha-mask (equal subtype "Alpha"))
+         (ctm (copy-list (gstate2-ctm (interp-state ip)))))
+    (unless (pdf-stream-p g) (return-from build-soft-mask nil))
+    (let* ((off (if alpha-mask
+                    (gesso:make-context cw ch :alpha t)
+                    (gesso:make-context cw ch
+                                        :background (smask-backdrop-rgb ip mask-dict))))
+           (oip (make-interp :ctx off
+                             :state (%make-gstate2 :ctm ctm)
+                             :resources (interp-resources ip)
+                             :doc doc
+                             :font-cache (interp-font-cache ip)
+                             :form-depth (interp-form-depth ip)
+                             :form-stack (interp-form-stack ip))))
+      (apply #'gesso:set-transform off ctm)
+      (do-form-xobject oip g)
+      (extract-mask off cw ch alpha-mask))))
+
 ;;; ---- annotation appearance streams (§12.5.5) ------------------------------
 (defun annot-appearance-stream (doc annot)
   "The normal appearance (/AP /N) form XObject for ANNOT, honouring the /AS

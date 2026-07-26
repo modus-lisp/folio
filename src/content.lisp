@@ -438,11 +438,37 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
 
+;;; Separable blend-mode names (§11.3.5) -> gesso keywords.  Normal/Compatible and
+;;; the four NON-separable modes (Hue/Saturation/Color/Luminosity, which need the
+;;; full-colour set/get-lum/sat machinery) fall back to source-over for now.
+(defparameter +blend-mode-map+
+  '(("Normal" . :normal) ("Compatible" . :normal)
+    ("Multiply" . :multiply) ("Screen" . :screen) ("Overlay" . :overlay)
+    ("Darken" . :darken) ("Lighten" . :lighten)
+    ("ColorDodge" . :color-dodge) ("ColorBurn" . :color-burn)
+    ("HardLight" . :hard-light) ("SoftLight" . :soft-light)
+    ("Difference" . :difference) ("Exclusion" . :exclusion)
+    ;; non-separable (§11.3.5.3) — approximated as Normal, noted as a gap
+    ("Hue" . :normal) ("Saturation" . :normal) ("Color" . :normal)
+    ("Luminosity" . :normal)))
+
+(defun parse-blend-mode (obj)
+  "Map a /BM operand (a name, or an array of names — the first the reader supports)
+to a gesso blend-mode keyword.  Unknown / absent -> :normal."
+  (let ((name (cond ((pdf-name-p obj) (pdf-name-string obj))
+                    ((pdf-array-p obj)
+                     (loop for x across obj
+                           for n = (and (pdf-name-p x) (pdf-name-string x))
+                           when (and n (assoc n +blend-mode-map+ :test #'string=))
+                             return n))
+                    (t nil))))
+    (or (cdr (assoc (or name "Normal") +blend-mode-map+ :test #'string=)) :normal)))
+
 (defun op-gs (ip name-obj)
-  "Apply a named graphics-state parameter dict (§8.4.5) from /Resources /ExtGState.
-Only the constant alphas /ca (fill) and /CA (stroke) are honoured; soft masks,
-blend modes and transfer functions are deferred."
-  (let* ((doc (interp-doc ip)) (s (interp-state ip))
+  "Apply a named graphics-state parameter dict (§8.4.5) from /Resources /ExtGState:
+the constant alphas /ca (fill) and /CA (stroke), the blend mode /BM (§11.3.5) and
+the soft mask /SMask (§11.6.5.2).  Transfer functions are still deferred."
+  (let* ((doc (interp-doc ip)) (s (interp-state ip)) (ctx (interp-ctx ip))
          (name (and (pdf-name-p name-obj) (pdf-name-string name-obj)))
          (egs (and name (interp-resources ip)
                    (resolve doc (dict-get (interp-resources ip) "ExtGState"))))
@@ -451,7 +477,18 @@ blend modes and transfer functions are deferred."
       (let ((fill-a (resolve doc (dict-get g "ca")))
             (stroke-a (resolve doc (dict-get g "CA"))))
         (when (numberp fill-a) (setf (gstate2-fill-alpha s) (max 0d0 (min 1d0 (num fill-a)))))
-        (when (numberp stroke-a) (setf (gstate2-stroke-alpha s) (max 0d0 (min 1d0 (num stroke-a)))))))))
+        (when (numberp stroke-a) (setf (gstate2-stroke-alpha s) (max 0d0 (min 1d0 (num stroke-a))))))
+      ;; ---- blend mode /BM ----
+      (let ((bm (resolve doc (dict-get g "BM"))))
+        (when bm (gesso:set-blend-mode ctx (parse-blend-mode bm))))
+      ;; ---- soft mask /SMask (a mask dict, or /None to clear) ----
+      (let ((sm (resolve doc (dict-get g "SMask"))))
+        (cond
+          ((null sm) nil)                                  ; entry absent: unchanged
+          ((and (pdf-name-p sm) (string= (pdf-name-string sm) "None"))
+           (gesso:set-soft-mask ctx nil))                  ; /None clears the mask
+          ((hash-table-p sm)
+           (gesso:set-soft-mask ctx (ignore-errors (build-soft-mask ip sm)))))))))
 
 (defun op-set-space (ip name-obj which)
   "Handle cs/CS: select a colour space and reset the colour to its initial value."

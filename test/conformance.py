@@ -50,6 +50,9 @@ MICRO = [
     ("img-inline",    P("img-inline.pdf"),    0, 2.0, "inline image (BI)"),
     ("ccitt-micro",   P("ccitt-micro.pdf"),   0, 4.0, "CCITT Group-4 fax image"),
     ("annot-stamp",   P("annot-stamp.pdf"),   0, 2.0, "annotation appearance (/AP)"),
+    ("blend-modes",   P("blend-modes.pdf"),   0, 3.0, "ExtGState blend modes (/BM)"),
+    ("smask-fade",    P("smask-fade.pdf"),    0, 3.0, "soft mask (/SMask luminosity)"),
+    ("smask-image",   P("smask-image.pdf"),   0, 3.0, "image under /SMask (vignette)"),
 ]
 REAL = [
     ("arxiv-p0",   P("real-arxiv.pdf"),          0, 1.5, "academic paper (title)"),
