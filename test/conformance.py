@@ -30,6 +30,13 @@ def P(*a):  # path in test/
 
 # ---- the corpus -------------------------------------------------------------
 # (name, pdf-path, page0, scale, tier, note)
+#
+# The hand-authored feature fixtures (a-rect, shade-*, jbig2-*, tile-*, type3-*,
+# img-*, cjk-cmap-*, etc.) ship in test/ and run out of the box.  Some entries
+# reference PDFs that are NOT redistributed (regenerable via the test/gen-*.py
+# scripts, or your own copies of the real-world papers) — if a PDF is absent the
+# harness prints "MISSING PDF (skipped)" for that row and carries on, so the
+# suite still runs and scores on whatever fixtures are present.
 MICRO = [
     ("a-rect",        P("a-rect.pdf"),        0, 2.0, "vector fill (re/f)"),
     ("b-flate",       P("b-flate.pdf"),       0, 2.0, "flate content stream"),
@@ -214,7 +221,7 @@ def main():
         st = status.get(key, {})
         folio_png = os.path.join(OUT, "folio-%s-p%d.png" % (name,page))
         if not os.path.exists(pdf):
-            rows.append((tier,name,note,"MISSING PDF",None,None)); continue
+            rows.append((tier,name,note,"MISSING PDF (skipped)",None,None)); continue
         try:
             opng = os.path.join(OUT, "pdfium-%s-p%d.png" % (name,page))
             oimg = render_pdfium(pdf, page, scale, opng)
