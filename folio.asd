@@ -25,6 +25,7 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF.  Milestone 0: the parse
                              (:file "font")
                              (:file "content")
                              (:file "ccitt")
+                             (:file "jbig2")
                              (:file "image")
                              (:file "shading")
                              (:file "pattern")

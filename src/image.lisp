@@ -504,6 +504,31 @@ abbreviation /DP): /K /Columns /Rows /BlackIs1 /EncodedByteAlign.  NIL on failur
        (values (ccitt-decode raw :columns columns :rows (or rows 0)
                                  :k k :black-is-1 black1 :byte-align align))))))
 
+;;; ---- JBIG2 fax images (§7.4.7) --------------------------------------------
+(defun jbig2-decode-image (ip dict raw)
+  "Decode the JBIG2Decode-filtered RAW bytes of image DICT into a packed 1-bit
+DeviceGray sample buffer.  Reads /DecodeParms /JBIG2Globals (a shared segment
+stream) if present.  NIL on failure."
+  (let* ((doc (interp-doc ip))
+         (parms (let ((p (resolve doc (or (dict-get dict "DecodeParms")
+                                          (dict-get dict "DP")))))
+                  (cond ((hash-table-p p) p)
+                        ((pdf-array-p p)
+                         (loop for i from (1- (length p)) downto 0
+                               for e = (resolve doc (aref p i))
+                               when (hash-table-p e) return e))
+                        (t nil))))
+         (gstream (and (hash-table-p parms)
+                       (resolve doc (dict-get parms "JBIG2Globals"))))
+         (globals (when (pdf-stream-p gstream)
+                    (ignore-errors
+                     (nth-value 0 (decode-stream gstream
+                                                 :resolver (lambda (v) (resolve doc v)))))))
+         (width (let ((x (img-dget doc dict "Width" "W"))) (and x (round (num x)))))
+         (height (let ((x (img-dget doc dict "Height" "H"))) (and x (round (num x))))))
+    (when (and width height (> width 0) (> height 0))
+      (ignore-errors (jbig2-decode raw globals width height)))))
+
 ;;; ---- painting an image XObject --------------------------------------------
 (defun draw-image-xobject (ip xobj)
   "Decode image XObject XOBJ and paint it through the CTM."
@@ -545,9 +570,17 @@ sample-unpacked) and blit it through the CTM onto the canvas."
              (multiple-value-bind (rgba w h) (decode-image-to-rgba ip dict bits nil)
                (when rgba (blit-rgba ip rgba w h)))
              (pushnew (car left) *deferred-image-filters* :test #'string=))))
+      ;; ---- JBIG2: decode the bilevel segments to a 1-bit sample buffer, then
+      ;;      run the ordinary BPC-1 / colour-space / ImageMask / Decode path ----
+      ((and left (member (car left) '("JBIG2Decode") :test #'string=))
+       (let ((bits (jbig2-decode-image ip dict data)))
+         (if bits
+             (multiple-value-bind (rgba w h) (decode-image-to-rgba ip dict bits nil)
+               (when rgba (blit-rgba ip rgba w h)))
+             (pushnew (car left) *deferred-image-filters* :test #'string=))))
       ;; ---- deferred codecs ----
       ((and left (member (car left)
-                         '("JPXDecode" "JBIG2Decode") :test #'string=))
+                         '("JPXDecode") :test #'string=))
        (pushnew (car left) *deferred-image-filters* :test #'string=))
       ;; ---- Flate/raw samples ----
       (t
