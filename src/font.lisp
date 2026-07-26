@@ -313,11 +313,14 @@ code cmap slots.  Returns a gid (0 = .notdef / missing)."
           (let ((gid (t1-name-gid t1 nm))) (when gid (return-from font-code->gid gid))))
         (return-from font-code->gid 0))))
   ;; An embedded CFF (FontFile3) is a name-keyed program: map the code's glyph
-  ;; name straight to a GID through the CFF charset.
+  ;; name straight to a GID through the CFF charset.  A subsetted CFF often renames
+  ;; its glyphs (g18, g152, ...) so the /Encoding name won't match — fall back to
+  ;; the font's own built-in Encoding (code -> GID), which such subsets carry.
   (let ((cff (pdf-font-cff font)))
     (when cff
       (let* ((name (and (pdf-font-encoding font) (aref (pdf-font-encoding font) code)))
-             (gid (and name (cff-name-gid cff name))))
+             (gid (or (and name (cff-name-gid cff name))
+                      (cff-code-gid cff code))))
         (return-from font-code->gid (or gid 0)))))
   (let* ((face (pdf-font-face font)))
     (unless face (return-from font-code->gid 0))

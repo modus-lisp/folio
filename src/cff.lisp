@@ -90,6 +90,7 @@ is a simple-vector of (start . end) absolute byte ranges into D."
   charset                        ; simple-vector gid->SID/CID, or NIL (=identity)
   cid->gid                       ; hash CID->GID (CID fonts), or NIL
   name->gid                      ; hash glyph-name -> GID (non-CID), or NIL
+  code->gid                      ; (simple-vector 256) built-in Encoding code->GID, or NIL
   (num-glyphs 0))
 
 ;;; ---- standard strings (SID < 391) — enough to name glyphs by SID -----------
@@ -124,7 +125,40 @@ is a simple-vector of (start . end) absolute byte ranges into D."
     "agrave" "aring" "atilde" "ccedilla" "eacute" "ecircumflex" "edieresis"
     "egrave" "iacute" "icircumflex" "idieresis" "igrave" "ntilde" "oacute"
     "ocircumflex" "odieresis" "ograve" "otilde" "scaron" "uacute" "ucircumflex"
-    "udieresis" "ugrave" "yacute" "ydieresis" "zcaron"))
+    "udieresis" "ugrave" "yacute" "ydieresis" "zcaron"
+    "exclamsmall" "Hungarumlautsmall" "dollaroldstyle" "dollarsuperior"
+    "ampersandsmall" "Acutesmall" "parenleftsuperior" "parenrightsuperior"
+    "twodotenleader" "onedotenleader" "zerooldstyle" "oneoldstyle"
+    "twooldstyle" "threeoldstyle" "fouroldstyle" "fiveoldstyle"
+    "sixoldstyle" "sevenoldstyle" "eightoldstyle" "nineoldstyle"
+    "commasuperior" "threequartersemdash" "periodsuperior" "questionsmall"
+    "asuperior" "bsuperior" "centsuperior" "dsuperior" "esuperior"
+    "isuperior" "lsuperior" "msuperior" "nsuperior" "osuperior" "rsuperior"
+    "ssuperior" "tsuperior" "ff" "ffi" "ffl" "parenleftinferior"
+    "parenrightinferior" "Circumflexsmall" "hyphensuperior" "Gravesmall"
+    "Asmall" "Bsmall" "Csmall" "Dsmall" "Esmall" "Fsmall" "Gsmall" "Hsmall"
+    "Ismall" "Jsmall" "Ksmall" "Lsmall" "Msmall" "Nsmall" "Osmall" "Psmall"
+    "Qsmall" "Rsmall" "Ssmall" "Tsmall" "Usmall" "Vsmall" "Wsmall" "Xsmall"
+    "Ysmall" "Zsmall" "colonmonetary" "onefitted" "rupiah" "Tildesmall"
+    "exclamdownsmall" "centoldstyle" "Lslashsmall" "Scaronsmall"
+    "Zcaronsmall" "Dieresissmall" "Brevesmall" "Caronsmall" "Dotaccentsmall"
+    "Macronsmall" "figuredash" "hypheninferior" "Ogoneksmall" "Ringsmall"
+    "Cedillasmall" "questiondownsmall" "oneeighth" "threeeighths"
+    "fiveeighths" "seveneighths" "onethird" "twothirds" "zerosuperior"
+    "foursuperior" "fivesuperior" "sixsuperior" "sevensuperior"
+    "eightsuperior" "ninesuperior" "zeroinferior" "oneinferior"
+    "twoinferior" "threeinferior" "fourinferior" "fiveinferior"
+    "sixinferior" "seveninferior" "eightinferior" "nineinferior"
+    "centinferior" "dollarinferior" "periodinferior" "commainferior"
+    "Agravesmall" "Aacutesmall" "Acircumflexsmall" "Atildesmall"
+    "Adieresissmall" "Aringsmall" "AEsmall" "Ccedillasmall" "Egravesmall"
+    "Eacutesmall" "Ecircumflexsmall" "Edieresissmall" "Igravesmall"
+    "Iacutesmall" "Icircumflexsmall" "Idieresissmall" "Ethsmall"
+    "Ntildesmall" "Ogravesmall" "Oacutesmall" "Ocircumflexsmall"
+    "Otildesmall" "Odieresissmall" "OEsmall" "Oslashsmall" "Ugravesmall"
+    "Uacutesmall" "Ucircumflexsmall" "Udieresissmall" "Yacutesmall"
+    "Thornsmall" "Ydieresissmall" "001.000" "001.001" "001.002" "001.003"
+    "Black" "Bold" "Book" "Light" "Medium" "Regular" "Roman" "Semibold"))
 
 (defun cff-sid-name (c sid)
   "Glyph name for string id SID: a standard string, else the CFF String INDEX."
@@ -156,6 +190,35 @@ GID 0 is always SID 0 (.notdef).  Predefined charsets (off 0/1/2) -> NIL."
            (incf p (if (= fmt 1) 3 4))
            (loop for i from 0 to nleft while (< gid nglyphs) do
              (setf (aref v gid) (+ first i)) (incf gid))))))
+    v))
+
+;;; ---- built-in Encoding (code -> GID) ---------------------------------------
+(defun cff-parse-encoding (d off nglyphs)
+  "Parse the CFF built-in Encoding at absolute OFF -> (simple-vector 256) code->GID
+(§ Appendix C, TN#5176), or NIL for a predefined encoding (off 0 = Standard, 1 =
+Expert; the caller resolves those by charset name).  Formats 0 (per-glyph codes)
+and 1 (ranges), plus the high-bit supplement table."
+  (when (<= off 1) (return-from cff-parse-encoding nil))
+  (let* ((v (make-array 256 :initial-element 0))
+         (b0 (cff-u8 d off)) (fmt (logand b0 #x7f)) (p (1+ off)))
+    (ecase fmt
+      (0 (let ((ncodes (cff-u8 d p)))
+           (incf p)
+           (loop for gid from 1 to ncodes while (< p (length d)) do
+             (let ((code (cff-u8 d p))) (incf p)
+               (when (< code 256) (setf (aref v code) gid))))))
+      (1 (let ((nranges (cff-u8 d p)) (gid 1))
+           (incf p)
+           (dotimes (r nranges)
+             (let ((first (cff-u8 d p)) (nleft (cff-u8 d (1+ p))))
+               (incf p 2)
+               (loop for code from first to (+ first nleft)
+                     while (< gid nglyphs) do
+                 (when (< code 256) (setf (aref v code) gid))
+                 (incf gid)))))))
+    ;; supplements (high bit of b0 set): [nSups] then (code SID) pairs — mapping a
+    ;; code to a glyph already reachable by SID.  We resolve the SID to a GID via
+    ;; the charset if present; harmless to skip when the base table already covers it.
     v))
 
 ;;; ---- FDSelect (GID -> FD index) --------------------------------------------
@@ -244,11 +307,20 @@ local-subr INDEX + bias and the nominal/default widths."
                       (if cs
                           (dotimes (g nglyphs)
                             (setf (gethash (cff-sid-name c (aref cs g)) h) g))
-                          ;; no charset: ISOAdobe order — SID = gid for gid<229
+                          ;; no charset: ISOAdobe order — SID = gid for gid<391
                           (dotimes (g nglyphs)
                             (when (< g (length +cff-standard-strings+))
                               (setf (gethash (aref +cff-standard-strings+ g) h) g))))
-                      (setf (cff-name->gid c) h))))
+                      (setf (cff-name->gid c) h))
+                    ;; built-in Encoding (code->GID): a subset font renamed to
+                    ;; g<NNN> glyphs relies on this, since its /Encoding names won't
+                    ;; match the charset.  op-16 of 0/1 (or absent) = a predefined
+                    ;; Standard/Expert encoding -> NIL (caller uses charset names).
+                    (let ((enc-off (or (first (cff-dict-val td 16)) 0)))
+                      (setf (cff-code->gid c)
+                            (when (> enc-off 1)
+                              (ignore-errors
+                               (cff-parse-encoding d (+ base enc-off) nglyphs)))))))
               c)))))))
 
 ;;; ---- CID -> GID / name -> GID accessors ------------------------------------
@@ -262,6 +334,12 @@ local-subr INDEX + bias and the nominal/default widths."
 (defun cff-name-gid (c name)
   "GID for a glyph NAME in a plain CFF, or NIL."
   (let ((h (cff-name->gid c))) (and h (gethash name h))))
+
+(defun cff-code-gid (c code)
+  "GID for a byte CODE via the CFF built-in Encoding, or NIL (predefined/absent)."
+  (let ((v (cff-code->gid c)))
+    (when (and v (<= 0 code 255))
+      (let ((g (aref v code))) (and (plusp g) g)))))
 
 (defun cff-upem (c)
   "Units per em implied by the FontMatrix (default 1/0.001 = 1000)."
