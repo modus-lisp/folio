@@ -61,6 +61,51 @@ the first readable candidate file, or NIL when none is installed."
                (setf (gethash kind *symbol-substitute-cache*) (or face :none))
                face)))))
 
+;;; ---- non-embedded CJK substitution (§9.7 + national simple TrueType) --------
+;;; A CID/CJK font with no embedded FontFile resolves code->CID (predefined CMap
+;;; or a national multi-byte encoding), then CID->Unicode via the registry's
+;;; Adobe-*-UCS2 CMap, then Unicode->GID through a broad system CJK face
+;;; (DroidSansFallback).  This paints real glyphs where there is no embedded
+;;; program (was blank/tofu, or byte-wise Latin mojibake for the simple case).
+
+(defparameter *cjk-fallback-paths*
+  '("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
+    "/usr/share/fonts/truetype/droid/DroidSansFallback.ttf"
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc")
+  "Candidate broad CJK faces for non-embedded CID substitution, tried in order.")
+
+(defvar *cjk-fallback-cache* :unset
+  "The loaded DroidSansFallback (broad CJK) scribe face, :none if unavailable.")
+
+(defun cjk-fallback-face ()
+  "The broad CJK substitute scribe face (DroidSansFallback), loaded + cached, or
+NIL when no such face is installed."
+  (when (eq *cjk-fallback-cache* :unset)
+    (setf *cjk-fallback-cache*
+          (or (dolist (path *cjk-fallback-paths*)
+                (when (probe-file path)
+                  (let ((f (ignore-errors
+                            (scribe:open-font
+                             (with-open-file (s path :element-type '(unsigned-byte 8))
+                               (let ((v (make-array (file-length s)
+                                                    :element-type '(unsigned-byte 8))))
+                                 (read-sequence v s) v))))))
+                    (when f (return f)))))
+              :none)))
+  (unless (eq *cjk-fallback-cache* :none) *cjk-fallback-cache*))
+
+(defun cjk-registry-ucs2-name (ordering)
+  "The Adobe-*-UCS2 (CID->Unicode) CMap name for a CIDSystemInfo /Ordering."
+  (cond ((null ordering) nil)
+        ((string= ordering "GB1") "Adobe-GB1-UCS2")
+        ((string= ordering "CNS1") "Adobe-CNS1-UCS2")
+        ((string= ordering "Japan1") "Adobe-Japan1-UCS2")
+        ((string= ordering "Japan2") "Adobe-Japan1-UCS2")
+        ((string= ordering "Korea1") "Adobe-Korea1-UCS2")
+        ((string= ordering "KR") "Adobe-KR-UCS2")
+        (t nil)))
+
 (defun base-encoding-vector (name)
   "The 256-entry code->glyph-name array for a base encoding NAME string."
   (cond ((string= name "WinAnsiEncoding") +winansi-names+)
@@ -158,7 +203,11 @@ metric table used when /Widths is absent; SYMBOLIC-P marks Symbol/ZapfDingbats."
   cmap                 ; decoded Encoding CMap (code -> CID), or NIL
   (cid-to-gid :identity) ; :identity or (simple-vector CID -> GID) for CIDFontType2
   (dw 1000d0)          ; /DW default CID width (1000/em)
-  cid-widths)          ; hash CID -> width (1000/em) from /W, or NIL
+  cid-widths           ; hash CID -> width (1000/em) from /W, or NIL
+  ;; ---- non-embedded CJK substitution (FACE = a broad CJK fallback face) ----
+  (cjk-fallback nil)   ; T = draw via FACE by CID/code -> Unicode -> face GID
+  cid-to-unicode       ; Adobe-*-UCS2 CMAPO (CID -> Unicode), or NIL
+  (cjk-simple nil))    ; T = a simple (non-Type0) national-encoding CJK font
 
 (defun %resolve (doc v) (resolve doc v))
 
@@ -323,6 +372,24 @@ Helvetica substitute on any error)."
                                                   (scribe:match-font families :weight 400 :style style))))
                                         (and reg (eq reg face))))))
                 (multiple-value-bind (wvec mw) (build-widths doc font-dict)
+                  ;; non-embedded simple font with a localized (high-byte) CJK
+                  ;; BaseFont name (e.g. 宋体 / 仿宋_GB2312, GBK-encoded): the text
+                  ;; is a national multi-byte encoding, not WinAnsi.  Segment it as
+                  ;; GBK, map code -> Adobe-GB1 CID -> Unicode -> the fallback face.
+                  (let ((fb (and (not embedded) basefont
+                                 (some (lambda (c) (> (char-code c) 127)) basefont)
+                                 (cjk-fallback-face))))
+                    (when fb
+                      (let ((nat (load-predefined-cmap "GBK-EUC-H"))
+                            (ucs (load-predefined-cmap "Adobe-GB1-UCS2")))
+                        (when (and nat ucs)
+                          (return-from load-simple-font
+                            (make-pdf-font
+                             :face fb :cjk-simple t :cjk-fallback t
+                             :upem (float (scribe:font-units-per-em fb) 1d0)
+                             :cmap nat :cid-to-unicode ucs
+                             :encoding (build-encoding doc font-dict base-names)
+                             :widths wvec :missing-width mw))))))
                   (make-pdf-font
                    :face face
                    :cff prog-cff
@@ -412,7 +479,13 @@ code cmap slots.  Returns a gid (0 = .notdef / missing)."
               (* (float (scribe::glyph-advance face gid) 1d0)
                  (/ 1000d0 (max 1d0 (pdf-font-upem font)))))))
         (let ((mw (pdf-font-missing-width font)))
-          (if (plusp mw) mw 500d0)))))
+          (cond ((plusp mw) mw)
+                ;; Type3 fonts carry authoritative /Widths + /FontMatrix; a code
+                ;; outside FirstChar..LastChar (e.g. the space in a word-spacing
+                ;; test) takes MissingWidth (default 0), NOT the 500-unit substitute
+                ;; heuristic — else every space gains a phantom 0.5em (§9.6.5, 9.2.4).
+                ((pdf-font-type3 font) 0d0)
+                (t 500d0))))))
 
 (defun font-glyph-contours (font gid)
   "The glyph outline (segment lists in font units) for GID, or NIL.  An embedded
@@ -500,29 +573,51 @@ default width /DW is returned as the second value."
              (face prog-face)
              (upem (cond (prog-cff (cff-upem prog-cff))
                          (face (float (scribe:font-units-per-em face) 1d0))
-                         (t 1000d0))))
+                         (t 1000d0)))
+             ;; non-embedded CID font: substitute a broad CJK face, mapping
+             ;; CID -> Unicode (registry UCS2 CMap) -> the fallback face's GID.
+             (fb (and (not (or face prog-cff)) (cjk-fallback-face)))
+             (ucs2 (and fb (let* ((csi (%resolve doc (dict-get cidfont "CIDSystemInfo")))
+                                  (o (and (hash-table-p csi)
+                                          (%resolve doc (dict-get csi "Ordering"))))
+                                  (ord (and (pdf-string-p o)
+                                            (map 'string #'code-char (pdf-string-bytes o)))))
+                             (load-predefined-cmap (cjk-registry-ucs2-name ord)))))
+             (use-fb (and fb ucs2)))
         (multiple-value-bind (wmap dw) (build-cid-widths doc cidfont)
           (make-pdf-font
            :composite t
            :cid-kind cid-kind
-           :face face
-           :cff prog-cff
-           :upem upem
+           :face (if use-fb fb face)
+           :cff (if use-fb nil prog-cff)
+           :upem (if use-fb (float (scribe:font-units-per-em fb) 1d0) upem)
            :embedded (and (or face prog-cff) t)
            :cmap cmap
            :cid-to-gid (if (eq cid-kind :type2) (build-cid-to-gid doc cidfont) :identity)
            :dw dw
-           :cid-widths wmap))))))
+           :cid-widths wmap
+           :cjk-fallback (and use-fb t)
+           :cid-to-unicode (and use-fb ucs2)))))))
+
+(defun cjk-fallback-gid (font cid)
+  "Non-embedded CID substitution: CID -> Unicode (registry UCS2 CMap) -> the
+fallback CJK face's GID, or 0 when unmapped."
+  (let* ((ucs (pdf-font-cid-to-unicode font))
+         (uni (and ucs (let ((u (cmap-code->cid ucs cid))) (and (plusp u) u))))
+         (face (pdf-font-face font)))
+    (or (and uni face (ignore-errors (scribe:font-glyph-index face uni))) 0)))
 
 (defun cid->gid (font cid)
   "Map a CID to a glyph id in FONT's descendant program."
-  (if (eq (pdf-font-cid-kind font) :type0)
-      (let ((cff (pdf-font-cff font)))
-        (if cff (cff-map-cid cff cid) cid))
-      (let ((m (pdf-font-cid-to-gid font)))    ; CIDFontType2
-        (cond ((eq m :identity) cid)
-              ((and (vectorp m) (< cid (length m))) (aref m cid))
-              (t 0)))))
+  (cond
+    ((pdf-font-cjk-fallback font) (cjk-fallback-gid font cid))
+    ((eq (pdf-font-cid-kind font) :type0)
+     (let ((cff (pdf-font-cff font)))
+       (if cff (cff-map-cid cff cid) cid)))
+    (t (let ((m (pdf-font-cid-to-gid font)))    ; CIDFontType2
+         (cond ((eq m :identity) cid)
+               ((and (vectorp m) (< cid (length m))) (aref m cid))
+               (t 0))))))
 
 (defun cid-width (font cid)
   "Advance width (1000/em) of CID: /W entry, else /DW."

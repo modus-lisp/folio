@@ -459,10 +459,17 @@ or NIL if the image cannot be produced (deferred codec, etc.)."
         (setf data (coerce data '(simple-array (unsigned-byte 8) (*)))))
       (cond
         ;; ---- 1-bit stencil mask (§8.9.6.2): paint the current fill colour ----
+        ;; When the current fill is a shading pattern (§8.7.3.3), the stencil's
+        ;; coverage shows the per-pixel gradient rather than a flat colour.
         (mask?
          (let* ((row-bytes (ceiling w 8))
+                (st (interp-state ip))
                 (fill (gesso:current-fill (interp-ctx ip)))
                 (fr (first fill)) (fg (second fill)) (fb (third fill))
+                (shfn (let ((pat (and (eq (gstate2-fill-space st) :pattern)
+                                      (gstate2-fill-pattern st))))
+                        (and pat (ignore-errors
+                                  (shading-pattern-stencil-fn ip pat (gstate2-ctm st))))))
                 ;; default Decode [0 1]: a decoded value of 0 is PAINTED
                 (paint-on-zero (or (null decode) (< (first decode) (second decode)))))
            (dotimes (row h)
@@ -471,8 +478,13 @@ or NIL if the image cannot be produced (deferred codec, etc.)."
                       (painted (if paint-on-zero (= s 0) (= s 1)))
                       (o (* 4 (+ (* row w) col))))
                  (when painted
-                   (setf (aref rgba o) fr (aref rgba (+ o 1)) fg
-                         (aref rgba (+ o 2)) fb (aref rgba (+ o 3)) 255)))))))
+                   (let ((rgb (and shfn (funcall shfn (/ (+ col 0.5d0) w)
+                                                 (- 1d0 (/ (+ row 0.5d0) h))))))
+                     (if rgb
+                         (setf (aref rgba o) (first rgb) (aref rgba (+ o 1)) (second rgb)
+                               (aref rgba (+ o 2)) (third rgb) (aref rgba (+ o 3)) 255)
+                         (setf (aref rgba o) fr (aref rgba (+ o 1)) fg
+                               (aref rgba (+ o 2)) fb (aref rgba (+ o 3)) 255)))))))))
         ;; ---- ordinary sampled image ----
         (t
          (multiple-value-bind (kind ncomp base)

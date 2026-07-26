@@ -476,8 +476,12 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
         ;; the glyph paints in the inherited text fill colour.
         ((string= kw "d0") nil)
         ((string= kw "d1")
-         (setf (interp-uncolored-color ip)
-               (or (ignore-errors (gesso:current-fill ctx)) '(0 0 0))))
+         (let ((fc (or (ignore-errors (gesso:current-fill ctx)) '(0 0 0))))
+           (setf (interp-uncolored-color ip) fc)
+           ;; A d1 glyph is a stencil: BOTH its fill AND stroke paint in the
+           ;; current nonstroking (fill) colour (§9.6.5).  Force the stroke colour
+           ;; too, else a stroke-only glyph proc paints in the page's stroke colour.
+           (ignore-errors (gesso:set-stroke ctx fc))))
 
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
@@ -709,6 +713,8 @@ and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
   (let* ((s (interp-state ip)) (font (gstate2-font s)))
     (when (and font (pdf-font-type3 font))
       (return-from show-text (show-text-type3 ip font bytes)))
+    (when (and font (pdf-font-cjk-simple font))
+      (return-from show-text (show-text-cjk-simple ip font bytes)))
     (when (and font (pdf-font-composite font))
       (if (font-drawable-p font)
           (return-from show-text (show-text-composite ip bytes))
@@ -728,6 +734,28 @@ and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
                (w0 (/ (font-code-width font code) 1000d0)))
           (paint-glyph ip font gid)
           (let ((tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
+            (setf (interp-tm ip)
+                  (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))))
+
+(defun show-text-cjk-simple (ip font bytes)
+  "Show a non-embedded simple CJK font's string: segment BYTES via the national
+encoding CMap (mixed 1/2-byte), map code -> CID -> Unicode -> the fallback face's
+GID, paint, and advance.  A 2-byte (CJK) code advances a full em; a 1-byte code
+uses the simple /Widths (WinAnsi), Tw applying only to single-byte code 32."
+  (let* ((s (interp-state ip)) (cm (pdf-font-cmap font))
+         (fs (gstate2-font-size s)) (tc (gstate2-char-spacing s))
+         (tw (gstate2-word-spacing s)) (th (gstate2-h-scale s))
+         (i 0) (n (length bytes)))
+    (loop while (< i n) do
+      (multiple-value-bind (code nb) (cmap-next-code cm bytes i)
+        (incf i nb)
+        (let* ((cid (cmap-code->cid cm code))
+               (gid (if (plusp cid) (cjk-fallback-gid font cid) 0))
+               (w0 (if (>= nb 2)
+                       1d0                       ; full-width CJK em
+                       (/ (font-code-width font code) 1000d0))))
+          (paint-glyph ip font gid)
+          (let ((tx (* (+ (* w0 fs) tc (if (and (= nb 1) (= code 32)) tw 0d0)) th)))
             (setf (interp-tm ip)
                   (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))))
 

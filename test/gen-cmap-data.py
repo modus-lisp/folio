@@ -73,6 +73,26 @@ def parse(path):
                     cid = int(parts[-1])
                     cidchars.append((int(hs[0], 16), cid))
                 i += 1
+        elif b"beginbfrange" in s:
+            # ToUnicode-style (the Adobe-*-UCS2 CMaps): map CID -> Unicode.
+            # Stored in the SAME cidrange table (the "cid" field carries the
+            # first Unicode of the range; %cidrange-lookup increments across it).
+            # The <lo> <hi> [<u..>] array form is skipped (rare, non-CJK).
+            i += 1
+            while i < n and b"endbfrange" not in lines[i]:
+                if b"[" not in lines[i]:
+                    hs = hexre_all(lines[i])
+                    if len(hs) >= 3:
+                        cidranges.append((int(hs[0], 16), int(hs[1], 16),
+                                          int(hs[2][:4], 16)))
+                i += 1
+        elif b"beginbfchar" in s:
+            i += 1
+            while i < n and b"endbfchar" not in lines[i]:
+                hs = hexre_all(lines[i])
+                if len(hs) >= 2:
+                    cidchars.append((int(hs[0], 16), int(hs[1][:4], 16)))
+                i += 1
         i += 1
     return wmode, usecmap, codespace, cidranges, cidchars
 

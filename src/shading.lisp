@@ -584,6 +584,35 @@ midpoint), used as a fallback when the pattern cannot be painted as a gradient
             (when func
               (funcall cvt (funcall func (list (/ (+ (first dom) (second dom)) 2d0)))))))))))
 
+(defun shading-pattern-stencil-fn (ip pat img-ctm)
+  "Return a closure (u v) -> (r g b) 0..255 that maps an ImageMask stencil's
+unit-square coordinates to shading pattern PAT's per-pixel gradient colour, or NIL
+if PAT is not a paintable shading pattern.  IMG-CTM maps the image unit square to
+device; the pattern maps pattern space to device via base-CTM · /Matrix, so a
+stencil painted under a shading-pattern fill (§8.7.3.3) shows the full gradient
+through its coverage rather than a flat representative colour."
+  (let* ((doc (interp-doc ip))
+         (pd (shading-pattern-obj doc pat)))
+    (when pd
+      (let* ((pdict (if (pdf-stream-p pd) (pdf-stream-dict pd) pd))
+             (pmatrix (or (mat-from-array doc (dict-get pdict "Matrix")) (gesso:mat-identity)))
+             (shading (resolve doc (dict-get pdict "Shading")))
+             (sdict (and shading (if (pdf-stream-p shading) (pdf-stream-dict shading) shading))))
+        (when (hash-table-p sdict)
+          (let* ((stype (let ((x (resolve doc (dict-get sdict "ShadingType"))))
+                          (if (numberp x) (round x) -1)))
+                 (evalfn (ignore-errors (shading-color-fn ip shading sdict stype)))
+                 (base (or (interp-base-ctm ip) img-ctm))
+                 (sctm (gesso:mat-mul base pmatrix))
+                 (sinv (gesso:mat-invert sctm)))
+            (when (and evalfn sinv)
+              ;; M maps image unit-square coords -> shading space:
+              ;;   device = img-ctm · (u,v) ;  shading = sinv · device
+              (let ((m (gesso:mat-mul sinv img-ctm)))
+                (lambda (u v)
+                  (multiple-value-bind (sx sy) (gesso:mat-apply m u v)
+                    (funcall evalfn sx sy)))))))))))
+
 (defun fill-with-shading-pattern (ip pat fill-rule)
   "Fill the current path with shading pattern PAT: clip to the path (FILL-RULE) and
 paint the pattern's shading.  The pattern /Matrix maps pattern space to the page's
