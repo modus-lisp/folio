@@ -28,4 +28,7 @@
    #:page-mediabox #:page-cropbox #:page-rotate #:page-resources
    #:page-content-bytes
    ;; ---- filters ----
-   #:decode-stream #:apply-filter))
+   #:decode-stream #:apply-filter
+   ;; ---- content-stream interpreter / rendering (M1) ----
+   #:render-page #:render-page-to-png
+   #:run-content #:make-interp #:interp #:device-transform))
