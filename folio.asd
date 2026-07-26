@@ -27,5 +27,6 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF.  Milestone 0: the parse
                              (:file "ccitt")
                              (:file "image")
                              (:file "shading")
+                             (:file "pattern")
                              (:file "render")
                              (:file "form")))))

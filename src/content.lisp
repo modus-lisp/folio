@@ -45,9 +45,13 @@
   (fill-alpha 1d0)                      ; ca  (non-stroking alpha)
   (stroke-alpha 1d0)                    ; CA  (stroking alpha)
   ;; ---- pattern colour (§8.7): the pattern object selected by scn/SCN under a
-  ;; Pattern colour space (a shading pattern paints a gradient into the filled path) ----
+  ;; Pattern colour space (a shading pattern paints a gradient into the filled path;
+  ;; a tiling pattern paints a replicated cell).  For an UNCOLORED (PaintType 2)
+  ;; tiling pattern the *-pattern-color slot holds the (r g b) the stencil paints. ----
   (fill-pattern nil)
-  (stroke-pattern nil))
+  (stroke-pattern nil)
+  (fill-pattern-color nil)
+  (stroke-pattern-color nil))
 
 (defun copy-gstate2 (s)
   (let ((n (%copy-gstate2 s)))
@@ -73,7 +77,11 @@
   ;; form-XObject recursion (§8.10.1): a depth counter + a stack of the form
   ;; streams currently being interpreted, to break reference cycles.
   (form-depth 0)
-  (form-stack nil))
+  (form-stack nil)
+  ;; when non-NIL (rendering an uncolored PaintType-2 tiling-pattern cell), colour
+  ;; operators in the content stream are ignored — the cell is a stencil painted in
+  ;; the single colour supplied with scn (§8.7.3.3).
+  (uncolored-color nil))
 
 ;;; ---- numeric coercion -----------------------------------------------------
 (declaim (inline num))
@@ -137,7 +145,9 @@ Indexed -> :indexed, Separation/DeviceN -> alternate).  Unknown -> :other."
               (multiple-value-bind (bk) (indexed-lookup ip doc spec)
                 (values :indexed bk)))
              ((and (pdf-name-p head) (string= (pdf-name-string head) "Pattern"))
-              (values :pattern nil))
+              ;; [/Pattern base]: BASE (if present) is the underlying colour space
+              ;; an UNCOLORED (PaintType 2) pattern's scn operands are given in.
+              (values :pattern (and (>= (length spec) 2) (resolve doc (aref spec 1)))))
              (t (values :other nil)))))
         (t (values kind nil))))))
 
@@ -240,17 +250,21 @@ the path.  CLOSE closes the current subpath first; FILL / STROKE select ops."
   (let ((ctx (interp-ctx ip)) (s (interp-state ip)))
     (when close (gesso:close-path ctx))
     (when fill
-      (let ((pat (and (eq (gstate2-fill-space s) :pattern)
-                      (gstate2-fill-pattern s)
-                      (shading-pattern-obj (interp-doc ip) (gstate2-fill-pattern s)))))
-        (if pat
-            ;; a shading pattern: paint its gradient clipped to the path (the path
-            ;; is left intact for a following stroke / pending clip)
-            (fill-with-shading-pattern ip pat fill-rule)
-            (progn
-              (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
-              (gesso:set-fill-rule ctx fill-rule)
-              (gesso:fill-path ctx)))))
+      (let* ((pobj (and (eq (gstate2-fill-space s) :pattern) (gstate2-fill-pattern s)))
+             (shpat (and pobj (shading-pattern-obj (interp-doc ip) pobj)))
+             (tilepat (and pobj (not shpat)
+                           (tiling-pattern-obj (interp-doc ip) pobj))))
+        (cond
+          ;; a shading pattern: paint its gradient clipped to the path (the path
+          ;; is left intact for a following stroke / pending clip)
+          (shpat (fill-with-shading-pattern ip shpat fill-rule))
+          ;; a tiling pattern: replicate its cell across the path region
+          (tilepat (fill-with-tiling-pattern ip tilepat fill-rule
+                                             (gstate2-fill-pattern-color s)))
+          (t
+           (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
+           (gesso:set-fill-rule ctx fill-rule)
+           (gesso:fill-path ctx)))))
     (when stroke
       (gesso:set-global-alpha ctx (gstate2-stroke-alpha s))
       (apply-line-width ip)
@@ -344,6 +358,13 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
   (let ((ctx (interp-ctx ip)) (s (interp-state ip)))
     (macrolet ((a (i) `(nth ,i args)))
       (cond
+        ;; ---- uncolored (PaintType 2) tiling-pattern cell: colour operators are
+        ;; ignored; the cell is a stencil painted in the scn-supplied colour ----
+        ((and (interp-uncolored-color ip)
+              (member kw '("g" "G" "rg" "RG" "k" "K" "cs" "CS" "sc" "scn" "SC" "SCN")
+                      :test #'string=))
+         nil)
+
         ;; ---- graphics state ----
         ((string= kw "q") (op-save ip))
         ((string= kw "Q") (op-restore ip))
@@ -452,9 +473,9 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
         ;; ---- unknown: operands already discarded by the caller ----
         (t nil)))))
 
-;;; Separable blend-mode names (§11.3.5) -> gesso keywords.  Normal/Compatible and
-;;; the four NON-separable modes (Hue/Saturation/Color/Luminosity, which need the
-;;; full-colour set/get-lum/sat machinery) fall back to source-over for now.
+;;; Blend-mode names (§11.3.5) -> gesso keywords: the 12 separable modes plus the
+;;; four NON-separable modes (Hue/Saturation/Color/Luminosity, §11.3.5.3), which
+;;; gesso composites via the Lum/SetLum/Sat/SetSat colour machinery.
 (defparameter +blend-mode-map+
   '(("Normal" . :normal) ("Compatible" . :normal)
     ("Multiply" . :multiply) ("Screen" . :screen) ("Overlay" . :overlay)
@@ -462,9 +483,9 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
     ("ColorDodge" . :color-dodge) ("ColorBurn" . :color-burn)
     ("HardLight" . :hard-light) ("SoftLight" . :soft-light)
     ("Difference" . :difference) ("Exclusion" . :exclusion)
-    ;; non-separable (§11.3.5.3) — approximated as Normal, noted as a gap
-    ("Hue" . :normal) ("Saturation" . :normal) ("Color" . :normal)
-    ("Luminosity" . :normal)))
+    ;; non-separable (§11.3.5.3)
+    ("Hue" . :hue) ("Saturation" . :saturation) ("Color" . :color)
+    ("Luminosity" . :luminosity)))
 
 (defun parse-blend-mode (obj)
   "Map a /BM operand (a name, or an array of names — the first the reader supports)
@@ -531,14 +552,22 @@ representative solid colour as a fallback (used for strokes / tiling patterns)."
     (cond
       ((and (eq kind :pattern) name-arg)
        (let* ((pat (resolve-pattern ip (pdf-name-string name-arg)))
-              (c (or (ignore-errors (shading-pattern-average ip pat)) '(128 128 128))))
+              ;; an uncolored (PaintType 2) tiling pattern carries its stencil colour
+              ;; as the numeric operands before the name, interpreted in the Pattern
+              ;; space's base colour space (stored in *-base at cs/CS time).
+              (ucolor (and nums (uncolored-pattern-p (interp-doc ip) pat)
+                           (ignore-errors (pattern-uncolored-rgb ip base nums))))
+              (c (or ucolor
+                     (ignore-errors (shading-pattern-average ip pat))
+                     '(128 128 128))))
          (if (eq which :fill)
-             (setf (gstate2-fill-pattern s) pat)
-             (setf (gstate2-stroke-pattern s) pat))
+             (setf (gstate2-fill-pattern s) pat (gstate2-fill-pattern-color s) ucolor)
+             (setf (gstate2-stroke-pattern s) pat (gstate2-stroke-pattern-color s) ucolor))
          (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c))))
       (t
-       (if (eq which :fill) (setf (gstate2-fill-pattern s) nil)
-           (setf (gstate2-stroke-pattern s) nil))
+       (if (eq which :fill)
+           (setf (gstate2-fill-pattern s) nil (gstate2-fill-pattern-color s) nil)
+           (setf (gstate2-stroke-pattern s) nil (gstate2-stroke-pattern-color s) nil))
        (let ((c (if (eq kind :pattern) '(128 128 128) (interpret-color kind base nums))))
          (if (eq which :fill) (gesso:set-fill ctx c) (gesso:set-stroke ctx c)))))))
 

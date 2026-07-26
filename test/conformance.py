@@ -60,6 +60,10 @@ MICRO = [
     ("shade-sampled", P("shade-sampled.pdf"), 0, 3.0, "axial + sampled fn (type-0)"),
     ("shade-ps",      P("shade-ps.pdf"),      0, 3.0, "axial + PostScript-calc fn (type-4)"),
     ("shade-smask",   P("shade-smask.pdf"),   0, 3.0, "gradient under a soft-mask group"),
+    ("tile-colored",  P("tile-colored.pdf"),  0, 3.0, "colored tiling pattern (PatternType 1)"),
+    ("tile-uncolored",P("tile-uncolored.pdf"),0, 3.0, "uncolored tiling stencil (PaintType 2)"),
+    ("tile-matrix",   P("tile-matrix.pdf"),   0, 3.0, "tiling pattern with rotated /Matrix"),
+    ("nonsep-blend",  P("nonsep-blend.pdf"),  0, 3.0, "non-separable blends (Hue/Sat/Color/Lum)"),
 ]
 REAL = [
     ("arxiv-p0",   P("real-arxiv.pdf"),          0, 1.5, "academic paper (title)"),
