@@ -99,6 +99,82 @@ the form's /Resources, recurse on its content, Q.  Guarded against cycles."
     (setf (interp-resources ip) saved-res)
     (op-restore ip)))                    ; Q
 
+;;; ---- annotation appearance streams (§12.5.5) ------------------------------
+(defun annot-appearance-stream (doc annot)
+  "The normal appearance (/AP /N) form XObject for ANNOT, honouring the /AS
+appearance-state selector when /N is a sub-dictionary of states.  NIL if none."
+  (let* ((ap (resolve doc (dict-get annot "AP")))
+         (n (and (hash-table-p ap) (resolve doc (dict-get ap "N")))))
+    (cond
+      ((pdf-stream-p n) n)
+      ((hash-table-p n)                  ; keyed by appearance state /AS
+       (let* ((as (resolve doc (dict-get annot "AS")))
+              (key (and (pdf-name-p as) (pdf-name-string as)))
+              (sel (or (and key (resolve doc (dict-get n key)))
+                       ;; no /AS: take the sole entry if there is exactly one
+                       (and (= (hash-table-count n) 1)
+                            (loop for v being the hash-values of n return (resolve doc v))))))
+         (and (pdf-stream-p sel) sel)))
+      (t nil))))
+
+(defun annot-hidden-p (doc annot)
+  "True when the annotation must not be rendered: the Hidden (2) or NoView (32)
+flag is set, or it is a /Popup or /Link (link rects carry no visible ink)."
+  (let* ((f (let ((x (resolve doc (dict-get annot "F")))) (if (integerp x) x 0)))
+         (st (resolve doc (dict-get annot "Subtype")))
+         (sub (and (pdf-name-p st) (pdf-name-string st))))
+    (or (logbitp 1 f) (logbitp 5 f)
+        (member sub '("Link" "Popup") :test #'equal))))
+
+(defun appearance-transform (doc ap rect)
+  "The matrix that maps an appearance stream's /Matrix-transformed /BBox onto the
+annotation /Rect (§12.5.5, algorithm 8.1) -> a gesso 6-tuple, or NIL."
+  (let* ((d (pdf-stream-dict ap))
+         (matrix (or (mat-from-array doc (dict-get d "Matrix")) (gesso:mat-identity)))
+         (b (resolve doc (dict-get d "BBox"))))
+    (unless (and (pdf-array-p b) (= (length b) 4) (= (length rect) 4)
+                 (every #'numberp rect))
+      (return-from appearance-transform nil))
+    (destructuring-bind (bx0 by0 bx1 by1)
+        (mapcar (lambda (x) (num (resolve doc x))) (coerce b 'list))
+      ;; transform the four BBox corners by Matrix, take the bounding box
+      (let (txs tys)
+        (dolist (c (list (list bx0 by0) (list bx1 by0) (list bx1 by1) (list bx0 by1)))
+          (multiple-value-bind (px py) (gesso:mat-apply matrix (first c) (second c))
+            (push px txs) (push py tys)))
+        (let* ((tx0 (reduce #'min txs)) (tx1 (reduce #'max txs))
+               (ty0 (reduce #'min tys)) (ty1 (reduce #'max tys))
+               (rx0 (min (first rect) (third rect))) (rx1 (max (first rect) (third rect)))
+               (ry0 (min (second rect) (fourth rect))) (ry1 (max (second rect) (fourth rect)))
+               (tw (- tx1 tx0)) (th (- ty1 ty0)))
+          (when (or (<= tw 0d0) (<= th 0d0)) (return-from appearance-transform nil))
+          (let ((sx (/ (- rx1 rx0) tw)) (sy (/ (- ry1 ry0) th)))
+            (list sx 0d0 0d0 sy (- rx0 (* sx tx0)) (- ry0 (* sy ty0)))))))))
+
+(defun render-annotations (ip page)
+  "Paint each page annotation's normal appearance stream (form fields, stamps,
+checkmarks, signatures, ink, etc.) positioned into its /Rect.  Runs after the
+page content, at the page base CTM (§12.5.5)."
+  (let* ((doc (interp-doc ip))
+         (annots (resolve doc (dict-get (page-dict page) "Annots"))))
+    (when (pdf-array-p annots)
+      (loop for aref across annots
+            for annot = (resolve doc aref)
+            when (hash-table-p annot) do
+        (unless (annot-hidden-p doc annot)
+          (let ((ap (annot-appearance-stream doc annot))
+                (rect (let ((r (resolve doc (dict-get annot "Rect"))))
+                        (when (and (pdf-array-p r) (= (length r) 4))
+                          (mapcar (lambda (x) (num (resolve doc x))) (coerce r 'list))))))
+            (when (and ap rect)
+              (let ((a (appearance-transform doc ap rect)))
+                (when a
+                  (ignore-errors
+                    (op-save ip)
+                    (apply #'op-cm ip a)
+                    (do-form-xobject ip ap)
+                    (op-restore ip)))))))))))
+
 ;;; ---- image colour space ---------------------------------------------------
 (defun image-color-space (ip csobj)
   "Resolve an image ColorSpace object to (values kind ncomp base).  KIND is one of

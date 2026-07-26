@@ -95,6 +95,10 @@ under the CTM) is painted; text and images are parsed but not yet drawn."
                                 :doc doc)))
           (apply #'gesso:set-transform ctx m)
           (clip-to-box ctx x0 y0 x1 y1)
-          (ignore-errors (run-content ip (page-content-bytes page)))
+          ;; An encrypted document we cannot decrypt would render its content as
+          ;; garbage; leave a clean (blank) page instead (§7.6, robustness).
+          (unless (eq (encryption-status doc) :unsupported)
+            (ignore-errors (run-content ip (page-content-bytes page)))
+            (ignore-errors (render-annotations ip page)))
           (gesso:write-png ctx path)
           path)))))

@@ -22,6 +22,9 @@
    #:document #:document-p #:parse-pdf
    #:document-trailer #:document-root #:document-version
    #:resolve #:object-count
+   ;; ---- encryption (standard security handler) ----
+   #:encryption-status #:encryption-reason
+   #:md5 #:rc4 #:sha256 #:sha384 #:sha512 #:aes-cbc-decrypt
    #:page-count #:get-page
    ;; ---- page struct ----
    #:page #:page-p #:page-dict #:page-number

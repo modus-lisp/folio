@@ -8,3 +8,6 @@ test/real-*.pdf
 test/out-*.png
 test/pdfium-*.png
 test/chrome-*.png
+test/conf-out/
+test/enc-*.pdf
+test/gov-*.pdf

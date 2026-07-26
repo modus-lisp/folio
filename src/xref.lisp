@@ -15,6 +15,7 @@
   (cache (make-hash-table))             ; object-number -> resolved object
   (objstm-cache (make-hash-table))      ; objstm-number -> (data first pairs)
   (pages nil)                           ; cached vector of leaf page entries
+  (crypt nil)                           ; CRYPT struct when /Encrypt is present
   (recovered nil))                      ; T if built by scan fallback
 
 ;; entry ::= (:offset byte-offset) | (:compressed objstm-num index)
@@ -63,8 +64,10 @@ follows object-stream indirection.  Never signals: a dangling ref -> PDF null."
     (cond
       ((null e) (pdf-null))
       ((eq (first e) :offset)
-       (values (parse-indirect-object (document-bytes doc) (second e)
-                                      :resolver (lambda (v) (resolve doc v)))))
+       (multiple-value-bind (obj onum ogen)
+           (parse-indirect-object (document-bytes doc) (second e)
+                                  :resolver (lambda (v) (resolve doc v)))
+         (maybe-decrypt-object doc obj (or onum num) (or ogen 0))))
       ((eq (first e) :compressed)
        (load-compressed doc (second e) (third e)))
       (t (pdf-null)))))

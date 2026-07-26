@@ -13,6 +13,7 @@ scan fallback) and the trailer, then index the page tree."
          (doc (%make-document :bytes v)))
     (setf (document-version doc) (read-version v))
     (read-xref doc)
+    (setup-decryption doc)
     (index-pages doc)
     doc))
 
