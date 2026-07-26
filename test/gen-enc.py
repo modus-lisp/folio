@@ -3,9 +3,14 @@
 an Adobe-Glyph-List subset (name->unicode), and the standard-14 AFM widths
 (name->width).  Sources: cl-pdf's encodings.lisp arrays + the standard-14 AFMs
 (both under quicklisp), plus Python's cp1252/mac_roman codecs for unicode."""
-import re, sys
+import re, sys, os
 
-CLPDF = "/home/claude/quicklisp/dists/ultralisp/software/mbattyani-cl-pdf-20230621073425"
+HERE = os.path.dirname(os.path.abspath(__file__))
+# cl-pdf's source tree (for its encodings.lisp + bundled standard-14 AFMs).
+# Override via $CLPDF; default is a typical Quicklisp install location.
+CLPDF = os.environ.get(
+    "CLPDF",
+    os.path.expanduser("~/quicklisp/dists/ultralisp/software/mbattyani-cl-pdf-20230621073425"))
 ENC = CLPDF + "/encodings.lisp"
 AFMDIR = CLPDF + "/afm/"
 
@@ -179,5 +184,5 @@ for key, d in afm_widths.items():
 w('    ))')
 w('')
 
-open('/home/claude/folio/src/enc-data.lisp', 'w').write('\n'.join(out))
+open(os.path.join(HERE, '..', 'src', 'enc-data.lisp'), 'w').write('\n'.join(out))
 print("wrote enc-data.lisp: agl=%d entries, afm fonts=%d" % (len(agl), len(afm_widths)))

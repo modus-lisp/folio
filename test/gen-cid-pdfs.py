@@ -138,6 +138,8 @@ if __name__=="__main__":
     DV="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     NR="/usr/share/fonts/opentype/urw-base35/NimbusRoman-Regular.otf"
     txt="Hello CID World 123"
-    build_cid("/home/claude/folio/test/real-cid-tt.pdf", DV, txt, cff=False)
-    build_cid("/home/claude/folio/test/real-cid-cff.pdf", NR, "Nimbus CFF CID 42", cff=True)
-    build_simple_cff("/home/claude/folio/test/real-simple-cff.pdf", NR, "Simple CFF abc")
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    build_cid(os.path.join(here, "real-cid-tt.pdf"), DV, txt, cff=False)
+    build_cid(os.path.join(here, "real-cid-cff.pdf"), NR, "Nimbus CFF CID 42", cff=True)
+    build_simple_cff(os.path.join(here, "real-simple-cff.pdf"), NR, "Simple CFF abc")

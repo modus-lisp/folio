@@ -1,7 +1,9 @@
-import io
+import io, os
 from fontTools.ttLib import TTFont
 from fontTools.subset import Subsetter, Options
-SRC="/home/claude/sourcehan.otf"
+HERE = os.path.dirname(os.path.abspath(__file__))
+# A CID-keyed CFF font (Source Han Serif or similar); override via $SOURCEHAN.
+SRC = os.environ.get("SOURCEHAN", "SourceHanSerif.otf")
 text="Aα漢字BC"   # latin + greek + kanji
 opts=Options(); opts.set(notdef_outline=True, glyph_names=True)
 f=TTFont(SRC)
@@ -51,5 +53,5 @@ for i,b in enumerate(objs,1):
 x=len(out); out+=b"xref\n0 %d\n0000000000 65535 f \n"%(len(objs)+1)
 for i in range(1,len(objs)+1): out+=b"%010d 00000 n \n"%offs[i]
 out+=b"trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(len(objs)+1,root,x)
-open("/home/claude/folio/test/real-cid-keyed.pdf","wb").write(out)
+open(os.path.join(HERE, "real-cid-keyed.pdf"),"wb").write(out)
 print("wrote real-cid-keyed.pdf codes=",codes)

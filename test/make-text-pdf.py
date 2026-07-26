@@ -2,7 +2,7 @@
 """Hand-author a minimal PDF (standard Helvetica, no embedded program) exercising
 the text machinery: a word at a known position, a TJ line with kerning, and an
 INVISIBLE (Tr 3) string that must NOT appear."""
-import struct, zlib, sys
+import struct, zlib, sys, os
 
 def obj(n, body):
     return ("%d 0 obj\n" % n).encode() + body + b"\nendobj\n"
@@ -49,5 +49,5 @@ for off in offsets:
     out += b"%010d 00000 n \n" % off
 out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs)+1, xref_pos)
 
-open("/home/claude/folio/test/text-test.pdf", "wb").write(out)
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "text-test.pdf"), "wb").write(out)
 print("wrote text-test.pdf (%d bytes)" % len(out))

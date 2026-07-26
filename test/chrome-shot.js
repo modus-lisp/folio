@@ -1,6 +1,6 @@
 // Render a PDF via Chrome's built-in pdfium viewer and screenshot the page.
 // usage: node chrome-shot.js <abs-pdf-path> <out-png> [widthCSSpx]
-const { chromium } = require('/home/claude/pw/node_modules/playwright');
+const { chromium } = require('playwright');
 (async () => {
   const [pdf, out, wArg] = process.argv.slice(2);
   const width = parseInt(wArg || '1224', 10); // 612pt * 2
