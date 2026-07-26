@@ -1,0 +1,33 @@
+data/cmaps.bin — predefined CJK CMap tables
+
+This file is a compact, preprocessed derivative of the Adobe CMap resources
+(the Adobe-Japan1, Adobe-GB1, Adobe-CNS1, Adobe-Korea1, Adobe-Japan2 and
+Adobe-KR predefined CMaps), produced by test/gen-cmap-data.py from the public
+cmap-resources project:
+
+    https://github.com/adobe-type-tools/cmap-resources
+
+Only the data folio needs is retained per CMap: the codespace ranges, the
+code->CID mappings (cidrange + cidchar), the /WMode flag and the usecmap parent
+name.  No PostScript program text is kept.
+
+The Adobe CMap resources are distributed under a BSD-style 3-clause licence:
+
+    Copyright 1990-2019 Adobe. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+    * Neither the name of Adobe nor the names of its contributors may be used to
+      endorse or promote products derived from this software without specific
+      prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DAMAGES ARISING IN ANY
+    WAY OUT OF THE USE OF THIS SOFTWARE.

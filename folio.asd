@@ -22,6 +22,7 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF.  Milestone 0: the parse
                              (:file "enc-data")
                              (:file "cff")
                              (:file "type1")
+                             (:file "cmap")
                              (:file "font")
                              (:file "content")
                              (:file "ccitt")

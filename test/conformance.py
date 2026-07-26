@@ -42,6 +42,8 @@ MICRO = [
     ("real-cid-tt",   P("real-cid-tt.pdf"),   0, 3.0, "Type0 CIDFontType2"),
     ("real-cid-cff",  P("real-cid-cff.pdf"),  0, 3.0, "Type0 CIDFontType0"),
     ("real-cid-keyed",P("real-cid-keyed.pdf"),0, 3.0, "CID-keyed CFF (CJK)"),
+    ("cjk-cmap-gb",   P("cjk-cmap-gb.pdf"),   0, 2.0, "Type0 named CMap /UniGB-UCS2-H (embedded CJK)"),
+    ("cjk-cmap-rksj", P("cjk-cmap-rksj.pdf"), 0, 2.0, "Type0 named CMap /90ms-RKSJ-H (mixed-width Shift-JIS)"),
     ("img-jpeg",      P("img-jpeg.pdf"),      0, 2.0, "DCTDecode image"),
     ("img-flate",     P("img-flate.pdf"),     0, 2.0, "flate RGB image"),
     ("img-mask",      P("img-mask.pdf"),      0, 2.0, "ImageMask stencil"),
