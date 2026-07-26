@@ -23,6 +23,44 @@
         (dolist (nw (cdr entry)) (setf (gethash (car nw) sub) (cdr nw)))
         (setf (gethash (car entry) h) sub)))))
 
+;;; ---- Symbol / ZapfDingbats substitute faces (§9.6.6.2, Annex D.5/D.6) ------
+;;; The two standard-14 symbolic fonts have no Latin encoding: their byte codes
+;;; select dingbats / mathematical + Greek glyphs through their OWN built-in
+;;; encoding.  When such a font is NOT embedded we substitute the URW base-35
+;;; equivalents (StandardSymbolsPS ≈ Symbol, D050000L ≈ ITC Zapf Dingbats), whose
+;;; cmap maps each built-in code straight to the matching glyph — so the code, not a
+;;; Latin glyph name, resolves the outline and •/✓/✗/arrows/Greek/math match pdfium.
+
+(defparameter *symbol-substitute-paths*
+  '((:symbol "/usr/share/fonts/opentype/urw-base35/StandardSymbolsPS.otf"
+             "/usr/share/fonts/type1/urw-base35/StandardSymbolsPS.t1"
+             "/usr/share/fonts/truetype/urw-base35/StandardSymbolsPS.ttf")
+    (:zapf   "/usr/share/fonts/opentype/urw-base35/D050000L.otf"
+             "/usr/share/fonts/truetype/urw-base35/D050000L.ttf"))
+  "Candidate files for the URW Symbol / ZapfDingbats substitutes, tried in order.")
+
+(defvar *symbol-substitute-cache* (make-hash-table :test 'eq)
+  "kind (:symbol/:zapf) -> loaded scribe face (or :none when unavailable).")
+
+(defun symbol-substitute-face (kind)
+  "The URW substitute scribe face for KIND (:symbol or :zapf), loaded + cached from
+the first readable candidate file, or NIL when none is installed."
+  (let ((cached (gethash kind *symbol-substitute-cache*)))
+    (cond ((eq cached :none) nil)
+          (cached cached)
+          (t (let ((face
+                     (dolist (path (cdr (assoc kind *symbol-substitute-paths*)))
+                       (when (probe-file path)
+                         (let ((f (ignore-errors
+                                    (scribe:open-font
+                                     (with-open-file (s path :element-type '(unsigned-byte 8))
+                                       (let ((v (make-array (file-length s)
+                                                            :element-type '(unsigned-byte 8))))
+                                         (read-sequence v s) v))))))
+                           (when f (return f)))))))
+               (setf (gethash kind *symbol-substitute-cache*) (or face :none))
+               face)))))
+
 (defun base-encoding-vector (name)
   "The 256-entry code->glyph-name array for a base encoding NAME string."
   (cond ((string= name "WinAnsiEncoding") +winansi-names+)
@@ -112,6 +150,8 @@ metric table used when /Widths is absent; SYMBOLIC-P marks Symbol/ZapfDingbats."
   type1                ; folio T1 object, or NIL
   (has-encoding nil)   ; T when the PDF font dict carried an explicit /Encoding
   (synth-bold nil)     ; embolden a regular substitute standing in for a bold font
+  (builtin-symbol nil) ; :symbol / :zapf — a non-embedded Symbol / ZapfDingbats font
+                       ; drawn through the URW substitute by its built-in code layout
   ;; ---- Type0 composite / CID font state (§9.7) ----
   (composite nil)      ; T = Type0 (multi-byte codes, CID indirection)
   cid-kind             ; :type2 (CIDFontType2, TrueType) or :type0 (CIDFontType0, CFF)
@@ -249,9 +289,16 @@ Helvetica substitute on any error)."
             (multiple-value-bind (prog-face prog-cff prog-kind prog-t1)
                 (read-font-program doc descriptor)
               (declare (ignore prog-kind))
-              (let* ((face (or prog-face
+              ;; non-embedded Symbol / ZapfDingbats -> the URW substitute face,
+              ;; resolved by the font's built-in code layout (builtin-symbol slot).
+              (let* ((sym-kind (and (not prog-face) (not prog-cff) (not prog-t1)
+                                    (cond ((string= afm-key "Symbol") :symbol)
+                                          ((string= afm-key "ZapfDingbats") :zapf))))
+                     (sym-face (and sym-kind (symbol-substitute-face sym-kind)))
+                     (face (or prog-face sym-face
                                (and (not prog-cff) (not prog-t1)
                                     (scribe:match-font families :weight weight :style style))))
+                     (builtin-symbol (and sym-face sym-kind))
                      (embedded (and (or prog-face prog-cff prog-t1) t))
                      (upem (cond (prog-cff (cff-upem prog-cff))
                                  (prog-t1 (t1-upem prog-t1))
@@ -282,6 +329,7 @@ Helvetica substitute on any error)."
                    :type1 prog-t1
                    :has-encoding has-enc
                    :synth-bold synth-bold
+                   :builtin-symbol builtin-symbol
                    :upem upem
                    :embedded embedded
                    :symbolic sym
@@ -326,6 +374,17 @@ code cmap slots.  Returns a gid (0 = .notdef / missing)."
     (unless face (return-from font-code->gid 0))
     (flet ((gi (cp) (let ((g (ignore-errors (scribe:font-glyph-index face cp))))
                       (and g (plusp g) g))))    ; guard: some subset cmaps are unparsable
+      ;; A non-embedded Symbol / ZapfDingbats font resolves through the URW
+      ;; substitute's OWN built-in encoding: the byte code (or its F0xx PUA alias)
+      ;; selects the glyph directly.  Only if the dict carried explicit /Differences
+      ;; do we consult the glyph name -> Unicode path (a customised symbol layout).
+      (when (pdf-font-builtin-symbol font)
+        (let ((direct (or (gi code) (gi (+ #xF000 code)))))
+          (when direct (return-from font-code->gid direct)))
+        (let* ((name (and (pdf-font-has-encoding font) (pdf-font-encoding font)
+                          (aref (pdf-font-encoding font) code)))
+               (uni (and name (glyph-name->unicode name))))
+          (return-from font-code->gid (or (and uni (gi uni)) 0))))
       (let* ((name (and (pdf-font-encoding font) (aref (pdf-font-encoding font) code)))
              (uni (and name (glyph-name->unicode name))))
         (or

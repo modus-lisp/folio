@@ -44,12 +44,109 @@ visited-set already breaks true reference cycles).")
                  (st (resolve doc (dict-get d "Subtype")))
                  (sub (and (pdf-name-p st) (pdf-name-string st))))
             (cond
-              ((equal sub "Form")  (do-form-xobject ip xobj))
+              ((equal sub "Form")  (do-form-xobject-dispatch ip xobj))
               ((equal sub "Image") (draw-image-xobject ip xobj))
               ;; some producers omit /Subtype: guess from the keys present
-              ((dict-get d "BBox")  (do-form-xobject ip xobj))
+              ((dict-get d "BBox")  (do-form-xobject-dispatch ip xobj))
               ((dict-get d "Width") (draw-image-xobject ip xobj))
               (t nil))))))))
+
+;;; ---- transparency groups (§11.4.5–11.4.7) ---------------------------------
+;;; A form XObject whose dict carries /Group << /S /Transparency >> is a
+;;; TRANSPARENCY GROUP: its members are composited among themselves onto the
+;;; group's own initial backdrop and the *result* is then composited onto the page
+;;; ONCE, honouring the constant alpha (/ca), soft mask and blend mode in force at
+;;; the `Do`.  Painting the members directly onto the page (as a plain form) makes a
+;;; semi-transparent group double-composite against the page and wash out.
+;;;
+;;; We only take the offscreen group path when the single composite would DIFFER
+;;; from painting directly — i.e. the group is drawn at constant alpha < 1, or a soft
+;;; mask / non-normal blend mode is active.  For an opaque group under a normal blend
+;;; with no mask, an isolated single composite is identical to direct painting, so we
+;;; keep the (byte-identical) plain form path.
+
+(defun transparency-group-dict (doc xobj)
+  "The /Group dict of form XOBJECT when it is a /S /Transparency group, else NIL."
+  (let* ((d (pdf-stream-dict xobj))
+         (grp (and (hash-table-p d) (resolve doc (dict-get d "Group")))))
+    (when (hash-table-p grp)
+      (let ((s (resolve doc (dict-get grp "S"))))
+        (when (and (pdf-name-p s) (string= (pdf-name-string s) "Transparency"))
+          grp)))))
+
+(defun do-form-xobject-dispatch (ip xobj)
+  "Dispatch a form XObject: a transparency group needing a real single composite
+goes through DO-TRANSPARENCY-GROUP; everything else through the plain form path."
+  (let* ((doc (interp-doc ip))
+         (ctx (interp-ctx ip))
+         (grp (transparency-group-dict doc xobj)))
+    (if (and grp
+             (or (< (gstate2-fill-alpha (interp-state ip)) 1d0)
+                 (gesso:soft-mask ctx)
+                 (not (eq (gesso:blend-mode ctx) :normal))))
+        (do-transparency-group ip xobj grp)
+        (do-form-xobject ip xobj))))
+
+(defun group-device-bbox (doc ctm xobj)
+  "Device-space bbox (values x0 y0 x1 y1) of the form's /BBox mapped through
+CTM · the form's /Matrix, or NIL when no usable /BBox."
+  (let* ((d (pdf-stream-dict xobj))
+         (b (resolve doc (dict-get d "BBox")))
+         (matrix (or (mat-from-array doc (dict-get d "Matrix")) (gesso:mat-identity))))
+    (when (and (pdf-array-p b) (= (length b) 4))
+      (let* ((bb (mapcar (lambda (x) (num (resolve doc x))) (coerce b 'list)))
+             (full (gesso:mat-mul ctm matrix))
+             (xs '()) (ys '()))
+        (destructuring-bind (x0 y0 x1 y1) bb
+          (dolist (c (list (cons x0 y0) (cons x1 y0) (cons x1 y1) (cons x0 y1)))
+            (multiple-value-bind (dx dy) (gesso:mat-apply full (car c) (cdr c))
+              (push dx xs) (push dy ys))))
+        (values (reduce #'min xs) (reduce #'min ys)
+                (reduce #'max xs) (reduce #'max ys))))))
+
+(defun do-transparency-group (ip xobj grp)
+  "Render a transparency-group form XObject to an OFFSCREEN RGBA canvas (its own
+initial backdrop), then composite that group result onto the page ONCE at the
+current constant alpha / soft mask / blend mode (ISO 32000-1 §11.4.6).
+
+/I true = ISOLATED: the initial backdrop is fully transparent (exact).  /I absent
+or false = NON-ISOLATED: approximated as isolated (the backdrop-removal of §11.4.5
+is not modelled — the visible difference only arises for non-normal blends against
+the page backdrop, rare).  /K true = KNOCKOUT: each element composites against the
+group's initial backdrop; for the common case of opaque elements this is identical
+to the isolated result we produce (documented approximation for the semi-transparent
+overlap case, which our coverage model folds into alpha)."
+  (when (or (>= (interp-form-depth ip) *form-depth-limit*)
+            (member xobj (interp-form-stack ip) :test #'eq))
+    (return-from do-transparency-group))
+  (let* ((doc (interp-doc ip))
+         (ctx (interp-ctx ip))
+         (cv (gesso:context-canvas ctx))
+         (cw (scribe:canvas-width cv)) (ch (scribe:canvas-height cv))
+         (ctm (copy-list (gstate2-ctm (interp-state ip))))
+         (group-alpha (gstate2-fill-alpha (interp-state ip)))
+         (off (gesso:make-context cw ch :alpha t))
+         (oip (make-interp :ctx off
+                           :state (%make-gstate2 :ctm (copy-list ctm))
+                           :resources (interp-resources ip)
+                           :base-ctm (interp-base-ctm ip)
+                           :doc doc
+                           :font-cache (interp-font-cache ip)
+                           :form-depth (interp-form-depth ip)
+                           :form-stack (interp-form-stack ip))))
+    (declare (ignorable grp))
+    (apply #'gesso:set-transform off ctm)
+    ;; render the group's members onto their own (transparent) initial backdrop
+    (do-form-xobject oip xobj)
+    ;; composite the group result onto the page once, at the group's constant alpha,
+    ;; through the page's active soft mask / blend mode (read by composite-group).
+    (multiple-value-bind (x0 y0 x1 y1) (group-device-bbox doc ctm xobj)
+      (gesso:set-global-alpha ctx group-alpha)
+      (if x0
+          (gesso:composite-group ctx off (floor x0) (floor y0)
+                                 (ceiling x1) (ceiling y1))
+          (gesso:composite-group ctx off))
+      (gesso:set-global-alpha ctx 1d0))))
 
 ;;; ---- form XObjects (§8.10.1) ----------------------------------------------
 (defun mat-from-array (doc v)
@@ -182,10 +279,16 @@ appearance-state selector when /N is a sub-dictionary of states.  NIL if none."
       ((hash-table-p n)                  ; keyed by appearance state /AS
        (let* ((as (resolve doc (dict-get annot "AS")))
               (key (and (pdf-name-p as) (pdf-name-string as)))
-              (sel (or (and key (resolve doc (dict-get n key)))
-                       ;; no /AS: take the sole entry if there is exactly one
-                       (and (= (hash-table-count n) 1)
-                            (loop for v being the hash-values of n return (resolve doc v))))))
+              (sel (cond
+                     ;; /AS names a state: draw exactly that appearance.  When the
+                     ;; named state is absent from /N (e.g. /AS Off but only an "Oui"
+                     ;; on-appearance exists), the widget is OFF -> draw NOTHING.  Do
+                     ;; NOT fall back to the sole entry here, or an unchecked box
+                     ;; renders as checked (§12.7.4.2.3).
+                     (key (resolve doc (dict-get n key)))
+                     ;; no /AS at all: take the sole entry if there is exactly one
+                     ((= (hash-table-count n) 1)
+                      (loop for v being the hash-values of n return (resolve doc v))))))
          (and (pdf-stream-p sel) sel)))
       (t nil))))
 
@@ -467,7 +570,13 @@ is an /SMask giving alpha directly from its grayscale samples."
                      (alpha (if stencil
                                 ;; default: sample 1 hides, 0 shows
                                 (if invert (if (= s 1) 255 0) (if (= s 1) 0 255))
-                                (round (* 255d0 (/ (float s 1d0) (float mmax 1d0)))))))
+                                ;; SMask: grayscale sample -> alpha, honouring a
+                                ;; /Decode remap (e.g. [1 0] inverts the alpha).
+                                (let ((frac (/ (float s 1d0) (float mmax 1d0))))
+                                  (when (and decode (>= (length decode) 2))
+                                    (setf frac (+ (first decode)
+                                                  (* frac (- (second decode) (first decode))))))
+                                  (round (* 255d0 (max 0d0 (min 1d0 frac))))))))
                 (setf (aref rgba (+ o 3))
                       (round (* (aref rgba (+ o 3)) alpha) 255))))))))))
 

@@ -70,6 +70,9 @@ MICRO = [
     ("jbig2-symbol",  P("jbig2-symbol.pdf"),  0, 2.0, "JBIG2 symbol dict + text region"),
     ("jbig2-globals", P("jbig2-globals.pdf"), 0, 2.0, "JBIG2 /JBIG2Globals shared symbols"),
     ("type3-vector",  P("type3-vector.pdf"),  0, 2.0, "Type3 font (CharProcs: d0/d1 vector + bitmap glyphs)"),
+    ("group-iso",     P("group-iso.pdf"),     0, 3.0, "isolated transparency group (ca=0.5)"),
+    ("group-knockout",P("group-knockout.pdf"),0, 3.0, "knockout transparency group (ca=0.5)"),
+    ("symdingbats",   P("symdingbats.pdf"),   0, 3.0, "Symbol + ZapfDingbats built-in encodings"),
 ]
 REAL = [
     ("arxiv-p0",   P("real-arxiv.pdf"),          0, 1.5, "academic paper (title)"),
@@ -117,7 +120,16 @@ def ink_geom(img, thresh=160):
                 bbox=(xs.min()/w, ys.min()/h, xs.max()/w, ys.max()/h))
 
 def render_pdfium(pdf, page, scale, out_png):
+    # Initialise the form environment so pdfium draws AcroForm widget appearances
+    # (field backgrounds, checkbox/radio states) — a PDF viewer (and folio) shows
+    # them, so the oracle must too; without init_forms the default render OMITS
+    # them, making a fair form-PDF comparison impossible (ISO 32000-1 §12.7).
     doc = pdfium.PdfDocument(pdf)
+    try:
+        if doc.get_formtype() != 0:   # FORMTYPE_NONE
+            doc.init_forms()
+    except Exception:
+        pass
     img = doc[page].render(scale=scale).to_pil().convert("RGB")
     img.save(out_png)
     return img
