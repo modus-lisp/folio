@@ -487,7 +487,7 @@ the `[`.  Returns a Lisp list (used by text ops we currently skip)."
           (setf (gstate2-font s)
                 (or (gethash fdict (interp-font-cache ip))
                     (setf (gethash fdict (interp-font-cache ip))
-                          (load-simple-font doc fdict)))))))))
+                          (load-font doc fdict)))))))))
 
 (defun op-text-move (ip tx ty)
   "Td: Tlm <- translate(tx,ty) x Tlm ; Tm <- Tlm."
@@ -556,11 +556,40 @@ text layer from garbaging the image."
             (gesso:stroke-path ctx))
           (gesso:begin-path ctx))))))
 
+(defun font-drawable-p (font)
+  "A font has glyph outlines we can paint (an sfnt face or an embedded CFF)."
+  (and font (not (pdf-font-type3 font))
+       (or (pdf-font-face font) (pdf-font-cff font))))
+
+(defun show-text-composite (ip bytes)
+  "Show a Type0 string: decode multi-byte codes to CIDs via the font's CMap, paint
+each glyph (CID -> GID), and advance by the per-CID /W width."
+  (let* ((s (interp-state ip)) (font (gstate2-font s))
+         (cm (pdf-font-cmap font))
+         (fs (gstate2-font-size s)) (tc (gstate2-char-spacing s))
+         (tw (gstate2-word-spacing s)) (th (gstate2-h-scale s))
+         (i 0) (n (length bytes)))
+    (loop while (< i n) do
+      (multiple-value-bind (code nb) (cmap-next-code cm bytes i)
+        (incf i nb)
+        (let* ((cid (cmap-code->cid cm code))
+               (gid (cid->gid font cid))
+               (w0 (/ (cid-width font cid) 1000d0)))
+          (paint-glyph ip font gid)
+          ;; word spacing applies only to a single-byte code 32 (§9.3.3)
+          (let ((tx (* (+ (* w0 fs) tc (if (and (= nb 1) (= code 32)) tw 0d0)) th)))
+            (setf (interp-tm ip)
+                  (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))))
+
 (defun show-text (ip bytes)
   "Show a byte string: for each code, paint its glyph at the text render matrix
 and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
   (let* ((s (interp-state ip)) (font (gstate2-font s)))
-    (unless (and font (pdf-font-face font) (not (pdf-font-type3 font)))
+    (when (and font (pdf-font-composite font))
+      (if (font-drawable-p font)
+          (return-from show-text (show-text-composite ip bytes))
+          (return-from show-text (advance-only-composite ip font bytes))))
+    (unless (and font (font-drawable-p font))
       ;; no drawable face (e.g. Type3 or a failed load): still advance the pen so
       ;; following text lands correctly, using widths if present.
       (when (and font (plusp (length bytes)))
@@ -588,3 +617,17 @@ and advance Tm by (w0*Tfs + Tc + Tw?)*Th in text space."
              (tx (* (+ (* w0 fs) tc (if (= code 32) tw 0d0)) th)))
         (setf (interp-tm ip)
               (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0)))))))
+
+(defun advance-only-composite (ip font bytes)
+  "Advance Tm across a Type0 string without painting (no drawable descendant)."
+  (let* ((s (interp-state ip)) (cm (pdf-font-cmap font))
+         (fs (gstate2-font-size s)) (tc (gstate2-char-spacing s))
+         (th (gstate2-h-scale s)) (i 0) (n (length bytes)))
+    (loop while (< i n) do
+      (multiple-value-bind (code nb) (cmap-next-code cm bytes i)
+        (declare (ignore code))
+        (incf i nb)
+        (let* ((cid (cmap-code->cid cm (bytes->uint bytes (- i nb) i)))
+               (tx (* (+ (* (/ (cid-width font cid) 1000d0) fs) tc) th)))
+          (setf (interp-tm ip)
+                (gesso:mat-mul (interp-tm ip) (gesso:mat-translate tx 0d0))))))))
