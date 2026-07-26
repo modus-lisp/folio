@@ -38,6 +38,7 @@ MICRO = [
     ("text-test",     P("text-test.pdf"),     0, 2.0, "text positioning"),
     ("real-sample",   P("real-sample.pdf"),   0, 2.0, "embedded TrueType"),
     ("real-simple-cff",P("real-simple-cff.pdf"),0, 3.0, "embedded CFF/Type1C"),
+    ("type1-embed",   P("type1-embed.pdf"),   0, 3.0, "embedded Type1 (FontFile/eexec)"),
     ("real-cid-tt",   P("real-cid-tt.pdf"),   0, 3.0, "Type0 CIDFontType2"),
     ("real-cid-cff",  P("real-cid-cff.pdf"),  0, 3.0, "Type0 CIDFontType0"),
     ("real-cid-keyed",P("real-cid-keyed.pdf"),0, 3.0, "CID-keyed CFF (CJK)"),

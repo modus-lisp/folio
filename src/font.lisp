@@ -104,6 +104,10 @@ metric table used when /Widths is absent; SYMBOLIC-P marks Symbol/ZapfDingbats."
   (type3 nil)          ; T for Type3 fonts (not rendered in M2)
   ;; ---- embedded CFF (FontFile3 / Type1C) drawn by the folio interpreter ----
   cff                  ; folio CFF object, or NIL (FACE is used instead)
+  ;; ---- embedded Type1 (FontFile / eexec) drawn by the folio interpreter ----
+  type1                ; folio T1 object, or NIL
+  (has-encoding nil)   ; T when the PDF font dict carried an explicit /Encoding
+  (synth-bold nil)     ; embolden a regular substitute standing in for a bold font
   ;; ---- Type0 composite / CID font state (§9.7) ----
   (composite nil)      ; T = Type0 (multi-byte codes, CID indirection)
   cid-kind             ; :type2 (CIDFontType2, TrueType) or :type0 (CIDFontType0, CFF)
@@ -124,9 +128,10 @@ metric table used when /Widths is absent; SYMBOLIC-P marks Symbol/ZapfDingbats."
 (defun read-font-program (doc descriptor)
   "If DESCRIPTOR carries a loadable font program decode it.  A FontFile2 (or an
 sfnt-wrapped FontFile3) is handed to scribe:open-font; a bare FontFile3 CFF /
-Type1C program is parsed by folio's own CFF interpreter.  Returns
-  (values scribe-face cff-object kind)
-where exactly one of SCRIBE-FACE / CFF-OBJECT is non-NIL (or both NIL), and KIND
+Type1C program is parsed by folio's own CFF interpreter; a FontFile (Adobe Type 1
+/ eexec) program is parsed by folio's own Type 1 interpreter.  Returns
+  (values scribe-face cff-object kind type1-object)
+where at most one of SCRIBE-FACE / CFF-OBJECT / TYPE1-OBJECT is non-NIL, and KIND
 is :truetype :cff :type1 or NIL so the caller can fall back to a substitute."
   (when (hash-table-p descriptor)
     (flet ((bytes (key) (let ((s (%resolve doc (dict-get descriptor key))))
@@ -140,7 +145,15 @@ is :truetype :cff :type1 or NIL so the caller can fall back to a substitute."
           (ff3 (if (%sfnt-bytes-p ff3)
                    (values (ignore-errors (scribe:open-font ff3)) nil :cff)
                    (values nil (ignore-errors (parse-cff ff3)) :cff)))
-          ((pdf-stream-p ff1) (values nil nil :type1))
+          ((pdf-stream-p ff1)
+           (let* ((body (bytes "FontFile"))
+                  (d (pdf-stream-dict ff1))
+                  (l1 (%resolve doc (dict-get d "Length1")))
+                  (l2 (%resolve doc (dict-get d "Length2")))
+                  (t1 (and body (ignore-errors
+                                 (parse-type1 body (and (integerp l1) l1)
+                                              (and (integerp l2) l2))))))
+             (values nil nil :type1 t1)))
           (t (values nil nil nil)))))))
 
 (defun build-encoding (doc font-dict base-names)
@@ -213,19 +226,44 @@ Helvetica substitute on any error)."
                  (sym (or symbolic flag-symbolic))
                  (base-names (cond (symbolic (base-encoding-vector afm-key))
                                    (t +standard-names+))))
-            ;; embedded program: FontFile2 TrueType, or a bare FontFile3 CFF.
-            (multiple-value-bind (prog-face prog-cff) (read-font-program doc descriptor)
+            ;; embedded program: FontFile2 TrueType, bare FontFile3 CFF, or
+            ;; FontFile Type 1 (eexec).
+            (multiple-value-bind (prog-face prog-cff prog-kind prog-t1)
+                (read-font-program doc descriptor)
+              (declare (ignore prog-kind))
               (let* ((face (or prog-face
-                               (and (not prog-cff)
+                               (and (not prog-cff) (not prog-t1)
                                     (scribe:match-font families :weight weight :style style))))
-                     (embedded (and (or prog-face prog-cff) t))
+                     (embedded (and (or prog-face prog-cff prog-t1) t))
                      (upem (cond (prog-cff (cff-upem prog-cff))
+                                 (prog-t1 (t1-upem prog-t1))
                                  (face (float (scribe:font-units-per-em face) 1d0))
-                                 (t 1000d0))))
+                                 (t 1000d0)))
+                     (has-enc (let ((e (%resolve doc (dict-get font-dict "Encoding"))))
+                                (or (pdf-name-p e) (hash-table-p e))))
+                     ;; bold indicated by the descriptor ForceBold flag (bit 19) or
+                     ;; a bold-ish BaseFont name; synthesise weight only when we fell
+                     ;; back to a regular substitute face (embedded outlines already
+                     ;; carry the correct weight).
+                     (bold-flag (and (integerp flags) (logbitp 18 flags)))
+                     (bold-name (let ((n (string-downcase (strip-subset-tag (or basefont "")))))
+                                  (or (search "bold" n) (search "black" n) (search "heavy" n)
+                                      (search "semibold" n) (search "medi" n))))
+                     ;; only synthesise when scribe has NO distinct bold face for this
+                     ;; family (the weight-700 match is EQ to the regular one — e.g.
+                     ;; single-weight DejaVu / Symbol / ZapfDingbats); Liberation bold
+                     ;; is already the right weight, so leave it alone.
+                     (synth-bold (and (or bold-flag bold-name) face (not embedded)
+                                      (let ((reg (ignore-errors
+                                                  (scribe:match-font families :weight 400 :style style))))
+                                        (and reg (eq reg face))))))
                 (multiple-value-bind (wvec mw) (build-widths doc font-dict)
                   (make-pdf-font
                    :face face
                    :cff prog-cff
+                   :type1 prog-t1
+                   :has-encoding has-enc
+                   :synth-bold synth-bold
                    :upem upem
                    :embedded embedded
                    :symbolic sym
@@ -243,6 +281,19 @@ Helvetica substitute on any error)."
   "Glyph id in FONT's face for byte CODE, via the encoding glyph name -> Unicode
 -> cmap.  Embedded symbolic TrueType fonts also try the (3,0) `F0xx` and the raw
 code cmap slots.  Returns a gid (0 = .notdef / missing)."
+  ;; An embedded Type 1 (FontFile) program is name-keyed.  Prefer the PDF /Encoding
+  ;; name when the dict carried one, else the font's own builtin /Encoding; fall back
+  ;; to whichever names an actual charstring so a subset's custom encoding is honoured.
+  (let ((t1 (pdf-font-type1 font)))
+    (when t1
+      (let* ((pdf-name (and (pdf-font-encoding font) (aref (pdf-font-encoding font) code)))
+             (builtin (t1-encoding t1))
+             (bname (and builtin (aref builtin code)))
+             (order (if (pdf-font-has-encoding font)
+                        (list pdf-name bname) (list bname pdf-name))))
+        (dolist (nm order)
+          (let ((gid (t1-name-gid t1 nm))) (when gid (return-from font-code->gid gid))))
+        (return-from font-code->gid 0))))
   ;; An embedded CFF (FontFile3) is a name-keyed program: map the code's glyph
   ;; name straight to a GID through the CFF charset.
   (let ((cff (pdf-font-cff font)))
@@ -286,11 +337,15 @@ code cmap slots.  Returns a gid (0 = .notdef / missing)."
 (defun font-glyph-contours (font gid)
   "The glyph outline (segment lists in font units) for GID, or NIL.  An embedded
 CFF is interpreted by folio; every other program is drawn through scribe."
-  (let ((cff (pdf-font-cff font)))
-    (if cff
-        (ignore-errors (cff-glyph-outline cff gid))
-        (let ((face (pdf-font-face font)))
-          (and face (ignore-errors (scribe::glyph-outline face gid)))))))
+  (let ((t1 (pdf-font-type1 font))
+        (cff (pdf-font-cff font)))
+    (cond
+      (t1 (let ((names (t1-names t1)))
+            (and (< -1 gid (length names))
+                 (ignore-errors (t1-glyph-outline t1 (aref names gid))))))
+      (cff (ignore-errors (cff-glyph-outline cff gid)))
+      (t (let ((face (pdf-font-face font)))
+           (and face (ignore-errors (scribe::glyph-outline face gid))))))))
 
 ;;; ===========================================================================
 ;;; Type0 / CID composite fonts (ISO 32000-1 §9.7)

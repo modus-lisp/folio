@@ -218,6 +218,15 @@ A user width of 0 means the thinnest device line (1 px), per §8.4.3.2."
                            (mapcar (lambda (x) (* (num x) sc)) (gstate2-dash s))
                            (* (gstate2-dash-phase s) sc)))))
 
+(defun synth-bold-width (ip)
+  "Device stroke width for synthetic bold: ~3% of the device em, floored so a
+small font still thickens visibly."
+  (let* ((s (interp-state ip))
+         (fs (gstate2-font-size s))
+         (sc (ctm-scale (gstate2-ctm s)))
+         (dev-em (* (abs fs) (abs (gstate2-h-scale s)) sc)))
+    (max 0.5d0 (* dev-em 0.03d0))))
+
 ;;; ---- painting -------------------------------------------------------------
 (defun do-paint (ip &key close fill stroke (fill-rule :nonzero))
   "Execute a path-painting operator, then honour a pending W/W* clip and reset
@@ -550,7 +559,16 @@ text layer from garbaging the image."
           (when (member mode '(0 2 4 6))        ; fill variants
             (gesso:set-global-alpha ctx (gstate2-fill-alpha s))
             (gesso:set-fill-rule ctx :nonzero)
-            (gesso:fill-path ctx))
+            (gesso:fill-path ctx)
+            ;; synthetic bold: stroke the filled outline in the fill colour with a
+            ;; hairline width so a regular substitute face standing in for a bold
+            ;; font renders with heavier weight (§ embedded outlines are left alone).
+            (when (pdf-font-synth-bold font)
+              (gesso:save ctx)
+              (gesso:set-stroke ctx (gesso:current-fill ctx))
+              (gesso:set-line-width ctx (synth-bold-width ip))
+              (gesso:stroke-path ctx)
+              (gesso:restore ctx)))
           (when (member mode '(1 2 5 6))        ; stroke variants
             (gesso:set-global-alpha ctx (gstate2-stroke-alpha s))
             (apply-line-width ip)
@@ -561,7 +579,7 @@ text layer from garbaging the image."
 (defun font-drawable-p (font)
   "A font has glyph outlines we can paint (an sfnt face or an embedded CFF)."
   (and font (not (pdf-font-type3 font))
-       (or (pdf-font-face font) (pdf-font-cff font))))
+       (or (pdf-font-face font) (pdf-font-cff font) (pdf-font-type1 font))))
 
 (defun show-text-composite (ip bytes)
   "Show a Type0 string: decode multi-byte codes to CIDs via the font's CMap, paint
