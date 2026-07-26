@@ -34,4 +34,15 @@
    #:decode-stream #:apply-filter
    ;; ---- content-stream interpreter / rendering (M1) ----
    #:render-page #:render-page-to-png
-   #:run-content #:make-interp #:interp #:device-transform))
+   #:run-content #:make-interp #:interp #:device-transform
+   ;; ---- interactive form recognition (AcroForm, §12.7) ----
+   #:has-acroform-p #:acroform-info #:acroform-has-xfa-p
+   #:form-fields #:describe-form #:pdf-text-string
+   #:form-field #:form-field-p
+   #:form-field-type #:form-field-name #:form-field-partial-name
+   #:form-field-tooltip #:form-field-value #:form-field-default-value
+   #:form-field-flags #:form-field-raw-flags #:form-field-options
+   #:form-field-indices #:form-field-signed #:form-field-widgets
+   #:form-field-rect #:form-field-page #:form-field-state #:form-field-dict
+   #:form-widget #:form-widget-p #:form-widget-rect #:form-widget-page
+   #:form-widget-state #:form-widget-on-states))
