@@ -251,134 +251,15 @@ Used only by the R6 hash (Algorithm 2.B)."
       out)))
 
 ;;; ======================================================================
-;;; SHA-2 (256 / 384 / 512) — needed only by the R6 (AES-256) key hash.
+;;; SHA-2 (256 / 384 / 512) -- needed only by the R6 (AES-256) key hash, which
+;;; runs 64+ rounds of them per password tried.  From natrium, the org's
+;;; canonical SHA-2: 7x (SHA-256) and 48x (SHA-512) faster on SBCL than the
+;;; version that was here.
 ;;; ======================================================================
 
-(defparameter +sha256-k+
-  #(#x428a2f98 #x71374491 #xb5c0fbcf #xe9b5dba5 #x3956c25b #x59f111f1 #x923f82a4 #xab1c5ed5
-    #xd807aa98 #x12835b01 #x243185be #x550c7dc3 #x72be5d74 #x80deb1fe #x9bdc06a7 #xc19bf174
-    #xe49b69c1 #xefbe4786 #x0fc19dc6 #x240ca1cc #x2de92c6f #x4a7484aa #x5cb0a9dc #x76f988da
-    #x983e5152 #xa831c66d #xb00327c8 #xbf597fc7 #xc6e00bf3 #xd5a79147 #x06ca6351 #x14292967
-    #x27b70a85 #x2e1b2138 #x4d2c6dfc #x53380d13 #x650a7354 #x766a0abb #x81c2c92e #x92722c85
-    #xa2bfe8a1 #xa81a664b #xc24b8b70 #xc76c51a3 #xd192e819 #xd6990624 #xf40e3585 #x106aa070
-    #x19a4c116 #x1e376c08 #x2748774c #x34b0bcb5 #x391c0cb3 #x4ed8aa4a #x5b9cca4f #x682e6ff3
-    #x748f82ee #x78a5636f #x84c87814 #x8cc70208 #x90befffa #xa4506ceb #xbef9a3f7 #xc67178f2))
-
-(declaim (inline ror32))
-(defun ror32 (x n) (u32 (logior (ash x (- n)) (ash x (- 32 n)))))
-
-(defun sha256 (bytes)
-  "SHA-256 of octet vector BYTES -> 32 octets."
-  (let* ((ml (length bytes))
-         (padded (make-array (* 64 (ceiling (+ ml 9) 64))
-                             :element-type '(unsigned-byte 8) :initial-element 0)))
-    (replace padded bytes)
-    (setf (aref padded ml) #x80)
-    (let ((bits (* ml 8)))
-      (dotimes (i 8) (setf (aref padded (- (length padded) 1 i)) (ldb (byte 8 (* 8 i)) bits))))
-    (let ((h (make-array 8 :initial-contents
-                         '(#x6a09e667 #xbb67ae85 #x3c6ef372 #xa54ff53a
-                           #x510e527f #x9b05688c #x1f83d9ab #x5be0cd19)))
-          (w (make-array 64)))
-      (loop for off from 0 below (length padded) by 64 do
-        (dotimes (i 16)
-          (setf (aref w i) (logior (ash (aref padded (+ off (* i 4))) 24)
-                                   (ash (aref padded (+ off (* i 4) 1)) 16)
-                                   (ash (aref padded (+ off (* i 4) 2)) 8)
-                                   (aref padded (+ off (* i 4) 3)))))
-        (loop for i from 16 below 64 do
-          (let ((s0 (logxor (ror32 (aref w (- i 15)) 7) (ror32 (aref w (- i 15)) 18) (ash (aref w (- i 15)) -3)))
-                (s1 (logxor (ror32 (aref w (- i 2)) 17) (ror32 (aref w (- i 2)) 19) (ash (aref w (- i 2)) -10))))
-            (setf (aref w i) (u32 (+ (aref w (- i 16)) s0 (aref w (- i 7)) s1)))))
-        (let ((a (aref h 0)) (b (aref h 1)) (c (aref h 2)) (d (aref h 3))
-              (e (aref h 4)) (f (aref h 5)) (g (aref h 6)) (hh (aref h 7)))
-          (dotimes (i 64)
-            (let* ((s1 (logxor (ror32 e 6) (ror32 e 11) (ror32 e 25)))
-                   (ch (logxor (logand e f) (logand (u32 (lognot e)) g)))
-                   (t1 (u32 (+ hh s1 ch (aref +sha256-k+ i) (aref w i))))
-                   (s0 (logxor (ror32 a 2) (ror32 a 13) (ror32 a 22)))
-                   (maj (logxor (logand a b) (logand a c) (logand b c)))
-                   (t2 (u32 (+ s0 maj))))
-              (setf hh g g f f e e (u32 (+ d t1)) d c c b b a a (u32 (+ t1 t2)))))
-          (setf (aref h 0) (u32 (+ (aref h 0) a)) (aref h 1) (u32 (+ (aref h 1) b))
-                (aref h 2) (u32 (+ (aref h 2) c)) (aref h 3) (u32 (+ (aref h 3) d))
-                (aref h 4) (u32 (+ (aref h 4) e)) (aref h 5) (u32 (+ (aref h 5) f))
-                (aref h 6) (u32 (+ (aref h 6) g)) (aref h 7) (u32 (+ (aref h 7) hh)))))
-      (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
-        (dotimes (i 8 out)
-          (dotimes (j 4) (setf (aref out (+ (* i 4) j)) (ldb (byte 8 (* 8 (- 3 j))) (aref h i)))))))))
-
-(defparameter +sha512-k+
-  #(#x428a2f98d728ae22 #x7137449123ef65cd #xb5c0fbcfec4d3b2f #xe9b5dba58189dbbc
-    #x3956c25bf348b538 #x59f111f1b605d019 #x923f82a4af194f9b #xab1c5ed5da6d8118
-    #xd807aa98a3030242 #x12835b0145706fbe #x243185be4ee4b28c #x550c7dc3d5ffb4e2
-    #x72be5d74f27b896f #x80deb1fe3b1696b1 #x9bdc06a725c71235 #xc19bf174cf692694
-    #xe49b69c19ef14ad2 #xefbe4786384f25e3 #x0fc19dc68b8cd5b5 #x240ca1cc77ac9c65
-    #x2de92c6f592b0275 #x4a7484aa6ea6e483 #x5cb0a9dcbd41fbd4 #x76f988da831153b5
-    #x983e5152ee66dfab #xa831c66d2db43210 #xb00327c898fb213f #xbf597fc7beef0ee4
-    #xc6e00bf33da88fc2 #xd5a79147930aa725 #x06ca6351e003826f #x142929670a0e6e70
-    #x27b70a8546d22ffc #x2e1b21385c26c926 #x4d2c6dfc5ac42aed #x53380d139d95b3df
-    #x650a73548baf63de #x766a0abb3c77b2a8 #x81c2c92e47edaee6 #x92722c851482353b
-    #xa2bfe8a14cf10364 #xa81a664bbc423001 #xc24b8b70d0f89791 #xc76c51a30654be30
-    #xd192e819d6ef5218 #xd69906245565a910 #xf40e35855771202a #x106aa07032bbd1b8
-    #x19a4c116b8d2d0c8 #x1e376c085141ab53 #x2748774cdf8eeb99 #x34b0bcb5e19b48a8
-    #x391c0cb3c5c95a63 #x4ed8aa4ae3418acb #x5b9cca4f7763e373 #x682e6ff3d6b2b8a3
-    #x748f82ee5defb2fc #x78a5636f43172f60 #x84c87814a1f0ab72 #x8cc702081a6439ec
-    #x90befffa23631e28 #xa4506cebde82bde9 #xbef9a3f7b2c67915 #xc67178f2e372532b
-    #xca273eceea26619c #xd186b8c721c0c207 #xeada7dd6cde0eb1e #xf57d4f7fee6ed178
-    #x06f067aa72176fba #x0a637dc5a2c898a6 #x113f9804bef90dae #x1b710b35131c471b
-    #x28db77f523047d84 #x32caab7b40c72493 #x3c9ebe0a15c9bebc #x431d67c49c100d4c
-    #x4cc5d4becb3e42b6 #x597f299cfc657e2a #x5fcb6fab3ad6faec #x6c44198c4a475817))
-
-(declaim (inline u64 ror64))
-(defun u64 (x) (logand x #xFFFFFFFFFFFFFFFF))
-(defun ror64 (x n) (u64 (logior (ash x (- n)) (ash x (- 64 n)))))
-
-(defun %sha512-core (bytes h0)
-  "SHA-512/384 compression over BYTES with initial hash vector H0 (8 x 64-bit)."
-  (let* ((ml (length bytes))
-         (padded (make-array (* 128 (ceiling (+ ml 17) 128))
-                             :element-type '(unsigned-byte 8) :initial-element 0)))
-    (replace padded bytes)
-    (setf (aref padded ml) #x80)
-    (let ((bits (* ml 8)))
-      (dotimes (i 8) (setf (aref padded (- (length padded) 1 i)) (ldb (byte 8 (* 8 i)) bits))))
-    (let ((h (copy-seq h0)) (w (make-array 80)))
-      (loop for off from 0 below (length padded) by 128 do
-        (dotimes (i 16)
-          (let ((v 0)) (dotimes (b 8) (setf v (logior (ash v 8) (aref padded (+ off (* i 8) b)))))
-            (setf (aref w i) v)))
-        (loop for i from 16 below 80 do
-          (let ((s0 (logxor (ror64 (aref w (- i 15)) 1) (ror64 (aref w (- i 15)) 8) (ash (aref w (- i 15)) -7)))
-                (s1 (logxor (ror64 (aref w (- i 2)) 19) (ror64 (aref w (- i 2)) 61) (ash (aref w (- i 2)) -6))))
-            (setf (aref w i) (u64 (+ (aref w (- i 16)) s0 (aref w (- i 7)) s1)))))
-        (let ((a (aref h 0)) (b (aref h 1)) (c (aref h 2)) (d (aref h 3))
-              (e (aref h 4)) (f (aref h 5)) (g (aref h 6)) (hh (aref h 7)))
-          (dotimes (i 80)
-            (let* ((s1 (logxor (ror64 e 14) (ror64 e 18) (ror64 e 41)))
-                   (ch (logxor (logand e f) (logand (u64 (lognot e)) g)))
-                   (t1 (u64 (+ hh s1 ch (aref +sha512-k+ i) (aref w i))))
-                   (s0 (logxor (ror64 a 28) (ror64 a 34) (ror64 a 39)))
-                   (maj (logxor (logand a b) (logand a c) (logand b c)))
-                   (t2 (u64 (+ s0 maj))))
-              (setf hh g g f f e e (u64 (+ d t1)) d c c b b a a (u64 (+ t1 t2)))))
-          (setf (aref h 0) (u64 (+ (aref h 0) a)) (aref h 1) (u64 (+ (aref h 1) b))
-                (aref h 2) (u64 (+ (aref h 2) c)) (aref h 3) (u64 (+ (aref h 3) d))
-                (aref h 4) (u64 (+ (aref h 4) e)) (aref h 5) (u64 (+ (aref h 5) f))
-                (aref h 6) (u64 (+ (aref h 6) g)) (aref h 7) (u64 (+ (aref h 7) hh)))))
-      h)))
-
-(defun sha512 (bytes)
-  (let ((h (%sha512-core bytes #(#x6a09e667f3bcc908 #xbb67ae8584caa73b #x3c6ef372fe94f82b #xa54ff53a5f1d36f1
-                                 #x510e527fade682d1 #x9b05688c2b3e6c1f #x1f83d9abfb41bd6b #x5be0cd19137e2179)))
-        (out (make-array 64 :element-type '(unsigned-byte 8))))
-    (dotimes (i 8 out) (dotimes (j 8) (setf (aref out (+ (* i 8) j)) (ldb (byte 8 (* 8 (- 7 j))) (aref h i)))))))
-
-(defun sha384 (bytes)
-  (let ((h (%sha512-core bytes #(#xcbbb9d5dc1059ed8 #x629a292a367cd507 #x9159015a3070dd17 #x152fecd8f70e5939
-                                 #x67332667ffc00b31 #x8eb44a8768581511 #xdb0c2e0d64f98fa7 #x47b5481dbefa4fa4)))
-        (out (make-array 48 :element-type '(unsigned-byte 8))))
-    (dotimes (i 6 out) (dotimes (j 8) (setf (aref out (+ (* i 8) j)) (ldb (byte 8 (* 8 (- 7 j))) (aref h i)))))))
+(defun sha256 (bytes) (natrium:sha256 (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+(defun sha384 (bytes) (natrium:sha384 (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+(defun sha512 (bytes) (natrium:sha512 (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
 
 ;;; ======================================================================
 ;;; The standard security handler

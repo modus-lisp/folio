@@ -12,7 +12,7 @@ but nothing renders them.  No FFI, no Poppler, no MuPDF."
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("gesso" "scribe" "pigment" "cram")
+  :depends-on ("gesso" "scribe" "pigment" "cram" "natrium")
   :serial t
   :components ((:module "src"
                 :serial t
