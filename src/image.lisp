@@ -668,6 +668,19 @@ stream) if present.  NIL on failure."
     (gesso:draw-image-rgba ctx rgba w h)
     (gesso:set-global-alpha ctx 1d0)))
 
+(defun %dct-scale (ip bytes)
+  "How much smaller than its own size a JPEG may be decoded and still cover the device pixels
+   the CTM gives it (the unit square's sides): 1, 2, 4 or 8 -- pigment's scaled decode.  A
+   slide deck's 3840x2160 photo shown 400 pixels wide decodes at 1/8: 0.5 MB of RGBA, not 33,
+   which a phone's document worker (64 MB) can hold."
+  (multiple-value-bind (iw ih) (ignore-errors (pigment:jpeg-size bytes))
+    (let* ((m (ignore-errors (gesso:ctm (interp-ctx ip))))
+           (dw (and (consp m) (sqrt (+ (expt (first m) 2) (expt (second m) 2)))))
+           (dh (and (consp m) (sqrt (+ (expt (third m) 2) (expt (fourth m) 2))))))
+      (if (and iw ih dw dh (plusp dw) (plusp dh))
+          (or (find-if (lambda (s) (and (>= (/ iw s) dw) (>= (/ ih s) dh))) '(8 4 2)) 1)
+          1))))
+
 (defun paint-decoded-image (ip dict data left)
   "Shared by image XObjects and inline images: build RGBA (DCT via pigment, else
 sample-unpacked) and blit it through the CTM onto the canvas."
@@ -675,9 +688,9 @@ sample-unpacked) and blit it through the CTM onto the canvas."
     (cond
       ;; ---- DCTDecode: hand the raw JPEG bytes to pigment ----
       ((and left (member (car left) '("DCTDecode" "DCT") :test #'string=))
-       (let ((img (ignore-errors (pigment:jpeg-decode
-                                  (if (typep data '(simple-array (unsigned-byte 8) (*)))
-                                      data (coerce data '(simple-array (unsigned-byte 8) (*))))))))
+       (let* ((bytes (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                         data (coerce data '(simple-array (unsigned-byte 8) (*)))))
+              (img (ignore-errors (pigment:jpeg-decode bytes :scale (%dct-scale ip bytes)))))
          (if (typep img 'pigment:img)
              (let ((rgba (pigment:img-rgba img))
                    (w (pigment:img-w img)) (h (pigment:img-h img)))
