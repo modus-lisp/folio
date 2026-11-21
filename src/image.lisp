@@ -678,7 +678,9 @@ stream) if present.  NIL on failure."
            (dw (and (consp m) (sqrt (+ (expt (first m) 2) (expt (second m) 2)))))
            (dh (and (consp m) (sqrt (+ (expt (third m) 2) (expt (fourth m) 2))))))
       (if (and iw ih dw dh (plusp dw) (plusp dh))
-          (or (find-if (lambda (s) (and (>= (/ iw s) dw) (>= (/ ih s) dh))) '(8 4 2)) 1)
+          ;; within a quarter: a page drawn at a phone's full density is 2600 pixels across, and a
+          ;; 4K photo on it decoded whole is 33 MB of RGBA -- 1920 of it is near enough
+          (or (find-if (lambda (s) (and (>= (* (/ iw s) 4/3) dw) (>= (* (/ ih s) 4/3) dh))) '(8 4 2)) 1)
           1))))
 
 (defun paint-decoded-image (ip dict data left)
